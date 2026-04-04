@@ -203,155 +203,17 @@ async def find_signup_button(task_id: str, page: Page) -> Optional[Locator]:
 
 # ── Spinbutton (year / month / day) ──────────────────────────────────────
 
-async def fill_spinbutton(page: Page, sb_index: int, target: int) -> None:
-    """
-    Fill the *sb_index*-th [role='spinbutton'] on the page to *target*.
-
-    Strategy (no locator.evaluate() → no 30-second per-element Playwright timeouts):
-      1. Read pre-click value via page.evaluate() on querySelectorAll.
-      2. Click to focus, then page.keyboard.type(str(target)) — trusted events.
-      3. Re-read value; if correct → Tab and return.
-      4. Fallback: ArrowUp/Down for the delta (capped at 200 presses).
-    """
-    CSS = "[role='spinbutton']"
-
-    # ── Pre-click snapshot (one JS call, no element timeout) ─────────────
-    before: Optional[int] = await page.evaluate(f"""
-        () => {{
-            const el = document.querySelectorAll('{CSS}')[{sb_index}];
-            if (!el) return null;
-            const raw = el.getAttribute('aria-valuenow') || el.innerText || '';
-            const n = parseInt(raw.replace(/[^0-9-]/g, ''), 10);
-            return isNaN(n) ? 0 : n;
-        }}
-    """)
-
-    # ── Click to focus ────────────────────────────────────────────────────
-    locator = page.locator(CSS).nth(sb_index)
-    try:
-        await locator.click(timeout=3_000)
-    except Exception as _ce:
-        logger.warning(f"[fill_spinbutton] sb[{sb_index}] click failed: {_ce}")
-        return
-    await asyncio.sleep(0.2)
-
-    # ── Type the value (trusted events, multi-char accumulation) ─────────
-    await page.keyboard.type(str(target), delay=30)
-    await asyncio.sleep(0.4)
-
-    # ── Post-type snapshot ────────────────────────────────────────────────
-    after: Optional[int] = await page.evaluate(f"""
-        () => {{
-            const el = document.querySelectorAll('{CSS}')[{sb_index}];
-            if (!el) return null;
-            const raw = el.getAttribute('aria-valuenow') || el.innerText || '';
-            const n = parseInt(raw.replace(/[^0-9-]/g, ''), 10);
-            return isNaN(n) ? null : n;
-        }}
-    """)
-
-    logger.debug(
-        f"[fill_spinbutton] sb[{sb_index}] target={target} "
-        f"before={before} after_type={after}"
-    )
-
-    if after == target:
-        await page.keyboard.press("Tab")
-        await asyncio.sleep(0.15)
-        return
-
-    # ── ArrowKey correction (capped at 200 presses ≈ 2 s) ────────────────
-    current = after if after is not None else (before or 0)
-    diff    = target - current
-
-    if abs(diff) > 200:
-        logger.warning(
-            f"[fill_spinbutton] sb[{sb_index}] delta too large ({diff}); "
-            f"current={current} target={target} — skipping arrow correction"
-        )
-    else:
-        key = "ArrowUp" if diff > 0 else "ArrowDown"
-        logger.debug(f"[fill_spinbutton] sb[{sb_index}] arrow-key fallback: {key} × {abs(diff)}")
-        for _ in range(abs(diff)):
-            await page.keyboard.press(key)
-            await asyncio.sleep(0.01)
-
-    await page.keyboard.press("Tab")
-    await asyncio.sleep(0.15)
-
-
 async def set_spinbutton(page: Page, locator: Locator, target: int) -> None:
     """
-    Adjust a spinbutton (role='spinbutton') to reach *target*.
-
-    Fast path 1: JS value-setter for native <input type='number'>.
-    Fast path 2: Click + select-all + type (works for many date-picker spinbuttons).
-    Fast path 3: Batch JS keydown dispatch (single IPC call, works for ARIA spinbuttons).
-    Fallback:    Individual ArrowUp/Down key presses (minimal delay).
+    Adjust a spinbutton (role='spinbutton') to reach *target* by pressing
+    ArrowUp / ArrowDown keys, mirroring the original JS _0x1d1 logic.
     """
-    # ── Diagnostic: log element info ─────────────────────────────────────
-    try:
-        info = await locator.evaluate("""
-            (el) => ({
-                tag:    el.tagName,
-                role:   el.getAttribute('role'),
-                label:  el.getAttribute('aria-label') || el.getAttribute('aria-labelledby') || '',
-                min:    el.getAttribute('aria-valuemin') || el.min || '',
-                max:    el.getAttribute('aria-valuemax') || el.max || '',
-                now:    el.getAttribute('aria-valuenow') || el.value || el.textContent || '',
-                type:   el.type || '',
-            })
-        """)
-        logger.debug(f"[spinbutton] target={target} info={info}")
-    except Exception:
-        info = {}
-
-    # Fast path 1: native <input type='number'> — set via React-compatible JS
-    try:
-        ok = await locator.evaluate(f"""
-            (el) => {{
-                if (el.tagName !== 'INPUT') return false;
-                const nv = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                );
-                nv.set.call(el, '{target}');
-                el.dispatchEvent(new Event('input',  {{bubbles: true}}));
-                el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                return true;
-            }}
-        """)
-        if ok:
-            await locator.press("Tab")
-            logger.debug(f"[spinbutton] fast-path-1 (JS native setter) used for target={target}")
-            return
-    except Exception:
-        pass
-
-    # Click to focus the element
     await locator.click()
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
 
-    # Fast path 2: select-all + type (works for many custom spinbuttons)
-    try:
-        await locator.press("Control+a")
-        await asyncio.sleep(0.05)
-        await locator.type(str(target), delay=0)
-        await asyncio.sleep(0.15)
-        # Verify the value was accepted
-        accepted_str: str = await locator.evaluate(
-            "el => el.getAttribute('aria-valuenow') || el.value || el.textContent || ''"
-        )
-        accepted_val = "".join(c for c in accepted_str if c.isdigit() or c == "-")
-        if accepted_val and int(accepted_val) == target:
-            await locator.press("Tab")
-            logger.debug(f"[spinbutton] fast-path-2 (type) used for target={target}")
-            return
-    except Exception:
-        pass
-
-    # Read current value to minimise the number of arrow key presses
+    # Read current value
     current_str: str = await locator.evaluate(
-        "el => el.getAttribute('aria-valuenow') || el.value || el.textContent || '0'"
+        "el => el.getAttribute('aria-valuenow') || el.textContent || '0'"
     )
     try:
         current = int("".join(c for c in current_str if c.isdigit() or c == "-"))
@@ -359,103 +221,13 @@ async def set_spinbutton(page: Page, locator: Locator, target: int) -> None:
         current = 0
 
     diff = target - current
-    logger.debug(f"[spinbutton] arrow-key fallback: current={current} target={target} diff={diff}")
-
-    if diff == 0:
-        await locator.press("Tab")
-        return
-
-    key_name = "ArrowUp" if diff > 0 else "ArrowDown"
-    key_code  = 38        if diff > 0 else 40
-
-    # Fast path 3: Batch JS keydown dispatch in a single IPC call
-    # (dispatches all N events without Python ↔ Playwright round-trip per press)
-    try:
-        await locator.evaluate(f"""
-            (el) => {{
-                el.focus();
-                for (let i = 0; i < {abs(diff)}; i++) {{
-                    el.dispatchEvent(new KeyboardEvent('keydown', {{
-                        key: '{key_name}', keyCode: {key_code},
-                        bubbles: true, cancelable: true
-                    }}));
-                    el.dispatchEvent(new KeyboardEvent('keyup', {{
-                        key: '{key_name}', keyCode: {key_code},
-                        bubbles: true, cancelable: true
-                    }}));
-                }}
-            }}
-        """)
-        # Verify the JS events actually changed the value
-        await asyncio.sleep(0.2)
-        post_str: str = await locator.evaluate(
-            "el => el.getAttribute('aria-valuenow') || el.value || el.textContent || ''"
-        )
-        post_val = "".join(c for c in post_str if c.isdigit() or c == "-")
-        if post_val and int(post_val) == target:
-            await locator.press("Tab")
-            logger.debug(f"[spinbutton] fast-path-3 (batch JS keydown) used for target={target}")
-            return
-        logger.debug(f"[spinbutton] batch JS keydown: post_val={post_str!r} expected={target} — falling back to individual presses")
-    except Exception as e:
-        logger.debug(f"[spinbutton] batch JS keydown failed: {e}")
-
-    # Fallback: individual Playwright key presses with minimal delay
-    # Each locator.press() dispatches a trusted event that React can't ignore.
+    key  = "ArrowUp" if diff > 0 else "ArrowDown"
     for _ in range(abs(diff)):
-        await locator.press(key_name)
-        await asyncio.sleep(0.002)
+        await locator.press(key)
+        await asyncio.sleep(0.04)
 
+    # Confirm the value
     await locator.press("Tab")
-
-
-async def detect_spinbutton_date_order(
-    page: Page,
-    spinbuttons,  # Playwright Locator
-) -> list[str]:
-    """
-    Detect the date-field order of 3 spinbuttons (year / month / day).
-
-    Strategy:
-    1. Check aria-label for obvious keywords (year, month, day).
-    2. Infer from aria-valuemin / aria-valuemax (year max > 1000, month max ≤ 31, day max ≤ 31 but year > 31).
-    3. Fall back to assumed MM/DD/YYYY order (US locale default).
-
-    Returns a list of 3 strings, e.g. ['month', 'day', 'year'].
-    """
-    order: list[str] = []
-    for i in range(3):
-        try:
-            meta = await spinbuttons.nth(i).evaluate("""
-                (el) => ({
-                    label: (el.getAttribute('aria-label') || '').toLowerCase(),
-                    min:   parseInt(el.getAttribute('aria-valuemin') || el.min || '0', 10),
-                    max:   parseInt(el.getAttribute('aria-valuemax') || el.max || '0', 10),
-                    now:   parseInt(el.getAttribute('aria-valuenow') || el.value || el.textContent || '0', 10),
-                })
-            """)
-            label = meta.get("label", "")
-            mn    = meta.get("min", 0)
-            mx    = meta.get("max", 0)
-
-            if "year" in label or mx > 200:
-                order.append("year")
-            elif "month" in label or (1 <= mx <= 12):
-                order.append("month")
-            elif "day" in label or (1 <= mx <= 31 and mx <= 31):
-                order.append("day")
-            else:
-                order.append(f"unknown({i})")
-        except Exception:
-            order.append(f"unknown({i})")
-
-    # If detection produced duplicates or unknowns, fall back to MM/DD/YYYY
-    if set(order) != {"year", "month", "day"}:
-        logger.debug(f"[spinbutton] detection ambiguous ({order}), assuming MM/DD/YYYY")
-        order = ["month", "day", "year"]
-
-    logger.debug(f"[spinbutton] detected date field order: {order}")
-    return order
 
 
 # ── Error page detection ──────────────────────────────────────────────────

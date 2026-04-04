@@ -267,22 +267,20 @@ async def _register_async(
             await accounts_mod.upsert(result)
 
             if use_pool and proxy:
-                success = result.get("status") in ("注册完成", "已获取Token")
+                success = result.get("status") == "注册完成"
                 await proxy_pool_mod.report_result(proxy, success)
 
-            status_icon = "✅" if result.get("status") in ("注册完成", "已获取Token") else "❌"
-            has_token   = "tokens" in result
+            status_icon = "✅" if result.get("status") == "注册完成" else "❌"
             console.print(
                 f"  {status_icon} [bold]{result.get('email', 'N/A')}[/bold]"
                 f"  status={result.get('status')}"
-                + (f"  🔑token=OK" if has_token else "")
             )
             return result
 
     tasks = [asyncio.create_task(_one(i + 1)) for i in range(count)]
     done  = await asyncio.gather(*tasks, return_exceptions=True)
 
-    ok  = sum(1 for r in done if isinstance(r, dict) and r.get("status") in ("注册完成", "已获取Token"))
+    ok  = sum(1 for r in done if isinstance(r, dict) and r.get("status") == "注册完成")
     fail = count - ok
     console.print(
         f"\n[bold]Summary:[/bold] {ok} succeeded, {fail} failed out of {count} total"

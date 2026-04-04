@@ -25,10 +25,8 @@ CLI dry-run:
 from __future__ import annotations
 
 import asyncio
-import json
 import random
 import string
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -36,7 +34,6 @@ from loguru import logger
 from playwright.async_api import Page
 
 from src.browser.engine import create_page
-from src.browser.oauth import acquire_tokens_via_browser
 from src.browser.helpers import (
     click_submit_or_text,
     find_signup_button,
@@ -56,56 +53,7 @@ LOGIN_URL   = "https://chatgpt.com/auth/login"
 AUTH0_HOST  = "auth.openai.com"
 
 MAX_RETRIES  = 5
-CODE_TIMEOUT = 180   # seconds to poll for OTP e-mail (legacy fallback)
-
-
-# ── Timing configuration ───────────────────────────────────────────────────
-
-@dataclass
-class TimingCfg:
-    """
-    All wait/timeout knobs in one place.
-    Load via TimingCfg.from_cfg(cfg) so values come from config.yaml.
-
-    config.yaml structure:
-        timing:
-          post_nav: 1.0      # s after GOTO_SIGNUP redirect (default 1.0, was 2.0)
-          pre_fill: 0.5      # s before each fill / click action (was 1.0)
-          post_click: 1.5    # s after signup-button / OTP submit click (was 3.0)
-          post_complete: 1.0 # s at COMPLETE before reading final URL (was 2.0)
-        timeout:
-          email_input: 15    # s to wait for email input
-          password_input: 30 # s to wait for password input (was 60)
-          otp_input: 30      # s to wait for OTP digit boxes (was 60)
-          profile_input: 20  # s to wait for firstName on about-you (was 30)
-          code_poll: 120     # s to poll mailbox for OTP code (was 180)
-    """
-    post_nav: float      = 1.0
-    pre_fill: float      = 0.5
-    post_click: float    = 1.5
-    post_complete: float = 1.0
-
-    email_input_ms: int    = 15_000
-    password_input_ms: int = 30_000
-    otp_input_ms: int      = 30_000
-    profile_input_ms: int  = 20_000
-    code_poll: int         = 120
-
-    @classmethod
-    def from_cfg(cls, cfg: dict) -> "TimingCfg":
-        t  = cfg.get("timing",  {}) or {}
-        to = cfg.get("timeout", {}) or {}
-        return cls(
-            post_nav      = float(t.get("post_nav",      1.0)),
-            pre_fill      = float(t.get("pre_fill",      0.5)),
-            post_click    = float(t.get("post_click",    1.5)),
-            post_complete = float(t.get("post_complete", 1.0)),
-            email_input_ms    = int(float(to.get("email_input",    15)) * 1000),
-            password_input_ms = int(float(to.get("password_input", 30)) * 1000),
-            otp_input_ms      = int(float(to.get("otp_input",      30)) * 1000),
-            profile_input_ms  = int(float(to.get("profile_input",  20)) * 1000),
-            code_poll         = int(to.get("code_poll", 120)),
-        )
+CODE_TIMEOUT = 180   # seconds to poll for OTP e-mail
 
 # Email selectors — mirrors tool.js GOTO_SIGNUP + FILL_EMAIL order
 _EMAIL_SELECTORS = [
@@ -133,24 +81,17 @@ _OTP_SINGLE_SELECTORS = [
 ]
 
 # Profile selectors — mirrors tool.js _0xcc0
-# OpenAI about-you page uses name='firstName'/'lastName' but also autocomplete attrs
 _FNAME_SELECTORS = [
     "input[name='firstName']",
     "input[name='first_name']",
     "input[id*='firstName']",
     "input[id*='first-name']",
-    "input[autocomplete='given-name']",
-    "input[placeholder*='first' i]",
-    "input[placeholder*='First' i]",
 ]
 _LNAME_SELECTORS = [
     "input[name='lastName']",
     "input[name='last_name']",
     "input[id*='lastName']",
     "input[id*='last-name']",
-    "input[autocomplete='family-name']",
-    "input[placeholder*='last' i]",
-    "input[placeholder*='Last' i]",
 ]
 
 # ── Name / birthday / password generators ─────────────────────────────────
@@ -242,9 +183,6 @@ async def register_one(
     if not headless and slow_mo == 0:
         slow_mo = 80
 
-    timing = TimingCfg.from_cfg(cfg)
-    logger.debug(f"[{task_id}] timing={timing}")
-
     logger.info(f"[{task_id}] Creating e-mail via {cfg.get('mail_provider', 'gptmail')}")
     try:
         email = await mail_client.generate_email(prefix=prefix, domain=domain)
@@ -268,41 +206,9 @@ async def register_one(
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info(f"[{task_id}] Attempt {attempt}/{MAX_RETRIES} — {email}")
-                await _state_machine(task_id, page, account, mail_client, timing)
+                await _state_machine(task_id, page, account, mail_client)
                 account["status"] = "注册完成"
                 logger.success(f"[{task_id}] ✅ Done: {email}")
-
-                # ── OAuth token acquisition ──────────────────────────────
-                oauth_cfg = cfg.get("oauth", {}) or {}
-                if oauth_cfg.get("enabled", True):
-                    token_timeout = float(oauth_cfg.get("timeout", 45))
-                    try:
-                        token_result = await acquire_tokens_via_browser(
-                            page, email,
-                            password=password,
-                            first_name=account["firstName"],
-                            last_name=account["lastName"],
-                            birthday=account["birthday"],
-                            proxy=proxy, timeout=token_timeout
-                        )
-                        if token_result:
-                            account["tokens"] = token_result.to_dict()
-                            account["status"] = "已获取Token"
-                            logger.success(
-                                f"[{task_id}] 🔑 Token acquired — "
-                                f"account_id={token_result.account_id} "
-                                f"expires={token_result.expires_at}"
-                            )
-                        else:
-                            logger.warning(
-                                f"[{task_id}] OAuth flow returned no token — "
-                                "registration saved without token"
-                            )
-                    except Exception as _oa_exc:
-                        logger.warning(
-                            f"[{task_id}] OAuth error (non-fatal): {_oa_exc}"
-                        )
-
                 return account
 
             except RegistrationError as exc:
@@ -334,49 +240,57 @@ async def _state_machine(
     page: Page,
     account: dict,
     mail_client: MailClient,
-    timing: TimingCfg,
 ) -> None:
     """
     Sequentially executes the 7-state flow matching tool.js _0x548_inner:
       GOTO_SIGNUP → FILL_EMAIL → FILL_PASSWORD → WAIT_CODE → FILL_CODE → FILL_PROFILE → COMPLETE
-    All wait/timeout values come from TimingCfg (config.yaml timing/timeout sections).
     """
-    T = timing  # shorthand
 
     # ── STATE: GOTO_SIGNUP ────────────────────────────────────────────
+    # tool.js: window.location.href = 'https://chatgpt.com/auth/login'
+    # NextAuth 302-redirects → auth.openai.com Universal Login
     logger.info(f"[{task_id}] GOTO_SIGNUP → {LOGIN_URL}")
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
 
+    # Wait for Auth0 redirect (usually < 5 s)
     try:
         await page.wait_for_url(f"**{AUTH0_HOST}**", timeout=8_000)
     except Exception:
         pass
 
-    # 鼠标预热：导航后先随机移动鼠标模拟真人入场
-    await _mouse_warmup(page)
-
-    # tool.js: await _0x1ae(0x7d0) — configurable post-nav wait
-    await jitter_sleep(T.post_nav, T.post_nav * 0.25)
+    # tool.js: await _0x1ae(0x7d0) — 2 s then check errors
+    # Add jitter so timing pattern is less uniform
+    await jitter_sleep(2.0, 0.5)
     await _assert_not_error(task_id, page)
     logger.debug(f"[{task_id}] GOTO_SIGNUP landed: {page.url}")
 
+    # ── tool.js GOTO_SIGNUP: check if email input already visible ────
+    # _vis('input[type="email"], input[name="email"], input[name="username"], #username')
     email_already_visible = await _find_visible_email_input(page)
 
     if email_already_visible:
+        # Auth0 has already shown the email form — skip signup button lookup
         logger.info(f"[{task_id}] Email input already visible — proceeding to FILL_EMAIL")
-        await jitter_sleep(T.pre_fill * 0.5, T.pre_fill * 0.15)
+        await jitter_sleep(0.5, 0.2)
     else:
+        # Find and click the "Sign Up" button
+        # tool.js: querySelector('a[href*="signup"], [data-testid="signup-link"]')
+        #          then text-match /^(sign up|sign up for free|免费注册|create account)$/i
         logger.info(f"[{task_id}] Looking for Sign Up button — URL={page.url}")
         signup_btn = await find_signup_button(task_id, page)
 
         if not signup_btn:
-            await jitter_sleep(T.post_click, T.post_click * 0.25)
+            # Give it another 3 s (tool.js retry cycle is 1.5 s)
+            await jitter_sleep(3.0, 0.8)
             signup_btn = await find_signup_button(task_id, page)
 
         if signup_btn:
             logger.info(f"[{task_id}] Clicking Sign Up button (human simulation)")
+            # Use human-like mouse movement before click — Auth0 detects direct clicks
             await human_move_and_click(page, signup_btn)
-            await jitter_sleep(T.post_click, T.post_click * 0.25)
+
+            # tool.js: await _0x1ae(0xbb8) — 3 s after clicking signup
+            await jitter_sleep(3.0, 0.8)
             await _assert_not_error(task_id, page)
             logger.debug(f"[{task_id}] After signup click: {page.url}")
         else:
@@ -385,8 +299,9 @@ async def _state_machine(
             )
 
     # ── STATE: FILL_EMAIL ─────────────────────────────────────────────
+    # tool.js: _0x1bf(email_selectors, 0x3a98) — wait up to 15 s
     logger.info(f"[{task_id}] FILL_EMAIL — URL={page.url}")
-    email_result = await wait_any_element(page, _EMAIL_SELECTORS, timeout_ms=T.email_input_ms)
+    email_result = await wait_any_element(page, _EMAIL_SELECTORS, timeout_ms=15_000)
     if not email_result:
         try:
             snippet = (await page.content())[:600]
@@ -398,10 +313,14 @@ async def _state_machine(
     matched_sel, email_el = email_result
     logger.debug(f"[{task_id}] Email input matched: {matched_sel!r}")
 
-    await jitter_sleep(T.pre_fill, T.pre_fill * 0.3)
-    await set_react_input(page, matched_sel, account["email"])
-    await jitter_sleep(T.pre_fill * 0.5, T.pre_fill * 0.15)
+    # tool.js: await _0x1ae(0x3e8) — 1 s before fill, add jitter
+    await jitter_sleep(1.0, 0.3)
 
+    # tool.js: _0x1c0(ei, d.email) — React nativeSetter + events
+    await set_react_input(page, matched_sel, account["email"])
+    await jitter_sleep(0.5, 0.2)
+
+    # Find submit button and use human click to avoid bot detection
     sub_loc = None
     try:
         sub = page.locator("button[type='submit']").first
@@ -424,8 +343,9 @@ async def _state_machine(
     logger.debug(f"[{task_id}] Email submitted")
 
     # ── STATE: FILL_PASSWORD ──────────────────────────────────────────
-    logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password input (≤{T.password_input_ms//1000} s)")
-    pw_result = await wait_any_element(page, _PASSWORD_SELECTORS, timeout_ms=T.password_input_ms)
+    # tool.js: _0x98d(d) — polls up to 60 s for password input
+    logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password input (≤60 s)")
+    pw_result = await wait_any_element(page, _PASSWORD_SELECTORS, timeout_ms=60_000)
     if not pw_result:
         raise RegistrationError(
             f"Password input not found after email submit. URL={page.url}"
@@ -435,11 +355,15 @@ async def _state_machine(
     matched_pw_sel, pw_el = pw_result
     logger.debug(f"[{task_id}] Password input matched: {matched_pw_sel!r}")
 
-    await jitter_sleep(T.pre_fill * 0.5, T.pre_fill * 0.15)
+    # tool.js: _0x1ae(0x1f4) — 0.5 s before fill, add jitter
+    await jitter_sleep(0.5, 0.2)
+
+    # tool.js: _0x1c0(pi, d.password)
     await set_react_input(page, matched_pw_sel, account["password"])
     logger.debug(f"[{task_id}] Password filled")
 
-    await jitter_sleep(T.pre_fill, T.pre_fill * 0.3)
+    # tool.js: _0x1ae(0x3e8) — 1 s then click submit (human simulation)
+    await jitter_sleep(1.0, 0.3)
     pw_sub_loc = None
     try:
         pw_sub = page.locator("button[type='submit']").first
@@ -462,8 +386,10 @@ async def _state_machine(
     logger.debug(f"[{task_id}] Password submitted — waiting for OTP page")
 
     # ── STATE: WAIT_CODE ──────────────────────────────────────────────
-    logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤{T.otp_input_ms//1000} s)")
-    otp_appeared = await _wait_for_otp_inputs(page, timeout_ms=T.otp_input_ms)
+    # tool.js: _0x98d wait loop — checks for input[maxlength="1"] or
+    # autocomplete="one-time-code" every 1 s, up to 60 s
+    logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤60 s)")
+    otp_appeared = await _wait_for_otp_inputs(page, timeout_ms=60_000)
     if not otp_appeared:
         raise RegistrationError(
             f"OTP input did not appear after password submit. URL={page.url}"
@@ -471,16 +397,18 @@ async def _state_machine(
     await _assert_not_error(task_id, page)
     logger.info(f"[{task_id}] OTP page loaded — polling gptmail inbox")
 
-    await jitter_sleep(T.post_nav, T.post_nav * 0.25)
-    code = await mail_client.poll_code(account["email"], timeout=T.code_poll)
+    # tool.js: _0xa9e — poll gptmail every 3 s up to 60 iterations
+    await jitter_sleep(2.0, 0.5)  # _0x1ae(0x7d0)
+    code = await mail_client.poll_code(account["email"], timeout=CODE_TIMEOUT)
     if not code:
         raise RegistrationError("OTP code not received within timeout")
 
     logger.info(f"[{task_id}] FILL_CODE → {code}")
 
     # ── STATE: FILL_CODE ──────────────────────────────────────────────
+    # tool.js: _0xbaf(c, d) — fill individual digit boxes or single field
     await _fill_otp(page, code)
-    await jitter_sleep(T.pre_fill, T.pre_fill * 0.3)
+    await jitter_sleep(1.0, 0.3)  # _0x1ae(0x3e8)
 
     submitted_otp = await click_submit_or_text(
         page, ["Continue", "Verify", "Submit", "继续"]
@@ -488,35 +416,29 @@ async def _state_machine(
     if not submitted_otp:
         logger.debug(f"[{task_id}] No OTP submit button — likely auto-submitted on last digit")
 
-    await jitter_sleep(T.post_click, T.post_click * 0.25)
+    await jitter_sleep(3.0, 0.8)
     await _assert_not_error(task_id, page)
     logger.debug(f"[{task_id}] After OTP, URL={page.url}")
 
     # ── STATE: FILL_PROFILE ───────────────────────────────────────────
+    # tool.js: _0xbaf waits up to 60 s for firstName input; then calls _0xcc0(d)
     logger.info(f"[{task_id}] Checking for FILL_PROFILE page")
-    fname_result = await wait_any_element(page, _FNAME_SELECTORS, timeout_ms=T.profile_input_ms)
-    # Also trigger profile fill when URL is about-you (selectors may miss the actual inputs)
-    if fname_result or "about-you" in page.url:
+    fname_result = await wait_any_element(page, _FNAME_SELECTORS, timeout_ms=15_000)
+    if fname_result:
         logger.info(f"[{task_id}] FILL_PROFILE — URL={page.url}")
-        await _fill_profile(task_id, page, account, T)
+        await _fill_profile(task_id, page, account)
     else:
-        logger.debug(f"[{task_id}] No profile form inputs at {page.url} — trying click-through")
-        # about-you page may only need a "Continue" / "Agree" click (age/terms confirmation)
-        clicked = await click_submit_or_text(
-            page, ["Continue", "Agree", "Accept", "同意", "Next", "Done"]
-        )
-        if clicked:
-            logger.debug(f"[{task_id}] Clicked through profile-less page")
-            await asyncio.sleep(T.post_click)
+        logger.debug(f"[{task_id}] No profile page — registration may be complete already")
 
     # ── STATE: COMPLETE ───────────────────────────────────────────────
+    # tool.js: !u.includes('auth.openai.com') && !u.includes('/auth/')
     logger.info(f"[{task_id}] COMPLETE — waiting for chatgpt.com redirect")
     try:
         await page.wait_for_url("**/chatgpt.com/**", timeout=20_000)
     except Exception:
         pass
 
-    await asyncio.sleep(T.post_complete)
+    await asyncio.sleep(2.0)
     final_url = page.url
     logger.info(f"[{task_id}] Final URL={final_url}")
 
@@ -527,38 +449,6 @@ async def _state_machine(
 
 
 # ── Sub-routines ───────────────────────────────────────────────────────────
-
-async def _mouse_warmup(page: Page) -> None:
-    """
-    Move the mouse in a natural arc after page load to create mouse-event history.
-    Cloudflare / Auth0 bot-detection scores sessions that have zero mouse-move
-    events before any click as robotic.
-
-    Simulates ~1.5 s of human "reading/scanning" cursor movement.
-    """
-    try:
-        # Start from a random edge-ish position
-        x, y = random.randint(300, 700), random.randint(100, 300)
-        await page.mouse.move(x, y)
-        # 3–5 micro-path segments with smooth easing
-        for _ in range(random.randint(3, 5)):
-            tx = x + random.randint(-200, 200)
-            ty = y + random.randint(-100, 150)
-            tx = max(60, min(tx, 1300))
-            ty = max(60, min(ty, 700))
-            steps = random.randint(6, 12)
-            for i in range(1, steps + 1):
-                t = i / steps
-                t = t * t * (3.0 - 2.0 * t)   # smoothstep
-                mx = x + (tx - x) * t + random.uniform(-3, 3)
-                my = y + (ty - y) * t + random.uniform(-2, 2)
-                await page.mouse.move(mx, my)
-                await asyncio.sleep(random.uniform(0.01, 0.03))
-            x, y = tx, ty
-            await asyncio.sleep(random.uniform(0.1, 0.35))
-    except Exception:
-        pass   # non-fatal: best-effort warmup
-
 
 async def _assert_not_error(task_id: str, page: Page) -> None:
     """
@@ -644,27 +534,17 @@ async def _fill_otp(page: Page, code: str) -> None:
                 break
 
 
-async def _fill_profile(task_id: str, page: Page, account: dict, timing: TimingCfg) -> None:
+async def _fill_profile(task_id: str, page: Page, account: dict) -> None:
     """
     Fill name + birthday spinbuttons.
-    Mirrors tool.js _0xcc0(d).
-
-    The about-you page structure (as of 2026-04):
-      - input[type='text', name='name']   — single combined name field
-      - input[type='number', name='age']  — age in years (appears after name is set)
-      - 3 role='spinbutton' elements      — year / month / day birthday pickers
+    Mirrors tool.js _0xcc0(d):
+      • querySelector firstName/lastName inputs → _0x1c0
+      • querySelectorAll('[role="spinbutton"]') → _0x1d1(sb, value)
+      • querySelector 'button[type="submit"]' → click
     """
     bd = account["birthday"]
-    T  = timing
 
-    # ── Compute age ──────────────────────────────────────────────────────────
-    from datetime import datetime as _dt
-    today = _dt.now()
-    age = today.year - bd["year"]
-    if (today.month, today.day) < (bd["month"], bd["day"]):
-        age -= 1
-    age = max(age, 1)
-
+    # Name fields
     fname_result = await wait_any_element(page, _FNAME_SELECTORS, timeout_ms=5_000)
     lname_result = await wait_any_element(page, _LNAME_SELECTORS, timeout_ms=5_000)
 
@@ -673,8 +553,8 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timing: TimingC
         l_sel, _ = lname_result
         await set_react_input(page, f_sel, account["firstName"])
         await set_react_input(page, l_sel, account["lastName"])
-        logger.info(f"[{task_id}] Filled firstName/lastName via selectors")
     else:
+        # Fallback: single full-name input
         name_result = await wait_any_element(
             page,
             ["input[name='name']", "input[name='fullName']", "input[id*='name']"],
@@ -682,107 +562,26 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timing: TimingC
         )
         if name_result:
             n_sel, _ = name_result
-            full_name = f"{account['firstName']} {account['lastName']}"
-            await set_react_input(page, n_sel, full_name)
-            logger.info(f"[{task_id}] Filled combined name '{full_name}' via selector {n_sel!r}")
+            await set_react_input(
+                page, n_sel,
+                f"{account['firstName']} {account['lastName']}"
+            )
         else:
-            # Final fallback: fill first visible non-form-control input with full name
-            full_name = json.dumps(f"{account['firstName']} {account['lastName']}")
-            filled = await page.evaluate(f"""
-                () => {{
-                    const BAD = new Set(['hidden','password','checkbox','radio',
-                                         'submit','button','file','image','reset']);
-                    const inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
-                        const r = el.getBoundingClientRect();
-                        const s = window.getComputedStyle(el);
-                        return r.width > 0 && r.height > 0
-                            && !BAD.has(el.type)
-                            && s.display !== 'none'
-                            && s.visibility !== 'hidden';
-                    }});
-                    if (inputs.length > 0) {{
-                        const el = inputs[0];
-                        const nv = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        );
-                        nv.set.call(el, {full_name});
-                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        el.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                        return inputs.map(i => ({{name:i.name,id:i.id,type:i.type,ph:i.placeholder}}));
-                    }}
-                    return null;
-                }}
-            """)
-            if filled:
-                logger.info(f"[{task_id}] Filled inputs[0] with name '{account['firstName']} {account['lastName']}' (JS fallback) — page inputs: {filled}")
-            else:
-                logger.warning(f"[{task_id}] No visible non-control inputs found for name on {page.url}")
-                try:
-                    all_inputs = await page.evaluate("""
-                        () => Array.from(document.querySelectorAll('input')).map(el => ({
-                            name: el.name, id: el.id, type: el.type,
-                            placeholder: el.placeholder,
-                            visible: el.getBoundingClientRect().width > 0
-                        }))
-                    """)
-                    logger.debug(f"[{task_id}] All inputs on page: {all_inputs}")
-                except Exception:
-                    pass
+            logger.warning(f"[{task_id}] Name inputs not found — skipping")
 
-    # ── Wait for age input to appear reactively (shown after name is set) ────
-    # The registration form uses birthday spinbuttons (not an age input).
-    # The age input (input[name='age']) only appears in the OAuth about-you flow.
-    # Use a SHORT timeout (2s) so we don't block spinbutton filling for 30s.
-    await asyncio.sleep(1.0)
-    age_result = await wait_any_element(
-        page, ["input[name='age']", "input[id*='age']"], timeout_ms=2_000
-    )
-    if age_result:
-        a_sel, _ = age_result
-        await set_react_input(page, a_sel, str(age))
-        logger.info(f"[{task_id}] Filled age={age} via {a_sel!r}")
+    await asyncio.sleep(0.5)  # _0x1ae(0x1f4)
+
+    # Birthday spinbuttons: [role="spinbutton"] year / month / day
+    spinbuttons = page.locator("[role='spinbutton']")
+    sb_count    = await spinbuttons.count()
+
+    if sb_count >= 3:
+        logger.info(f"[{task_id}] Setting birthday via spinbuttons: {bd}")
+        await set_spinbutton(page, spinbuttons.nth(0), bd["year"])
+        await set_spinbutton(page, spinbuttons.nth(1), bd["month"])
+        await set_spinbutton(page, spinbuttons.nth(2), bd["day"])
     else:
-        logger.debug(f"[{task_id}] No age input visible — form uses birthday spinbuttons")
-
-    # ── Birthday spinbuttons (year / month / day) ────────────────────────────
-    # Use page.evaluate() for one-shot spinbutton detection — avoids locator.evaluate()
-    # per-element Playwright timeouts (30 s each) that caused ~4-minute hangs.
-    sb_info = await page.evaluate("""
-        () => {
-            const sbs = Array.from(document.querySelectorAll('[role="spinbutton"]'));
-            return sbs.map((el, i) => ({
-                idx:   i,
-                label: (el.getAttribute('aria-label') || '').toLowerCase(),
-                max:   parseInt(el.getAttribute('aria-valuemax') || '0', 10),
-                now:   parseInt(el.getAttribute('aria-valuenow') || el.innerText || '0', 10),
-            }));
-        }
-    """)
-    logger.info(f"[{task_id}] Spinbutton info (one-shot): {sb_info}")
-
-    if len(sb_info) >= 3:
-        # Detect field order from aria-valuemax
-        def _detect_sb_field(info: dict) -> str:
-            label = info.get("label", "")
-            mx    = info.get("max", 0)
-            if "year"  in label or mx > 200:          return "year"
-            if "month" in label or (0 < mx <= 12):    return "month"
-            if "day"   in label or (12 < mx <= 31):   return "day"
-            return "unknown"
-
-        field_order = [_detect_sb_field(sb) for sb in sb_info[:3]]
-        if set(field_order) != {"year", "month", "day"}:
-            logger.debug(f"[{task_id}] Order detection ambiguous ({field_order}), defaulting MM/DD/YYYY")
-            field_order = ["month", "day", "year"]
-
-        logger.info(f"[{task_id}] Setting birthday {bd} via spinbuttons (order={field_order})")
-        from src.browser.helpers import fill_spinbutton
-        for i, field in enumerate(field_order):
-            val = bd.get(field, 1)
-            await fill_spinbutton(page, i, val)
-            logger.debug(f"[{task_id}] sb[{i}] {field}={val} done")
-    else:
+        # Fallback: date input
         date_str = (
             f"{bd['year']}/{str(bd['month']).zfill(2)}/{str(bd['day']).zfill(2)}"
         )
@@ -794,40 +593,17 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timing: TimingC
         if date_result:
             d_sel, _ = date_result
             await set_react_input(page, d_sel, date_str)
-        else:
-            # Final fallback: fill second visible input with date "YYYY/MM/DD"
-            bdate = json.dumps(date_str)
-            filled_bd = await page.evaluate(f"""
-                () => {{
-                    const inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0 && el.type !== 'hidden';
-                    }});
-                    if (inputs.length > 1) {{
-                        const el = inputs[1];
-                        const nv = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value'
-                        );
-                        nv.set.call(el, {bdate});
-                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        return true;
-                    }}
-                    return false;
-                }}
-            """)
-            if filled_bd:
-                logger.info(f"[{task_id}] Filled second visible input with birthday (JS fallback)")
 
-    await asyncio.sleep(T.pre_fill * 0.5)
+    await asyncio.sleep(0.5)
 
+    # Submit profile
     submitted = await click_submit_or_text(
         page, ["Continue", "Agree", "同意", "Next", "Finish", "Done", "继续"]
     )
     if not submitted:
         logger.warning(f"[{task_id}] Profile submit button not found")
 
-    await asyncio.sleep(T.post_click)
+    await asyncio.sleep(2.0)
     logger.debug(f"[{task_id}] After profile submit, URL={page.url}")
 
 

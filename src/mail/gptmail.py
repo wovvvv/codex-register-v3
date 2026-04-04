@@ -39,30 +39,10 @@ class GPTMailClient(MailClient):
 
     # ── generate ─────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _is_valid_email(email: str) -> bool:
-        """Return True if the generated email looks usable for registration."""
-        if not email or "@" not in email:
-            return False
-        _, domain = email.rsplit("@", 1)
-        domain = domain.lower()
-        # Reject reverse-DNS / arpa domains (e.g. 5.2.5.b.0.d.0.0.1.0.a.2.ip6.arpa)
-        if domain.endswith(".arpa") or domain.endswith(".arpa."):
-            return False
-        # Must have at least one dot (TLD)
-        if "." not in domain:
-            return False
-        # TLD must be alphabetic (not all digits)
-        tld = domain.rsplit(".", 1)[-1]
-        if not tld.isalpha():
-            return False
-        return True
-
     async def generate_email(
         self,
         prefix: Optional[str] = None,
         domain: Optional[str] = None,
-        max_retries: int = 5,
     ) -> str:
         body: dict = {}
         if prefix:
@@ -70,39 +50,30 @@ class GPTMailClient(MailClient):
         if domain:
             body["domain"] = domain
 
-        for attempt in range(1, max_retries + 1):
-            async with httpx.AsyncClient(timeout=30) as client:
-                if body:
-                    r = await client.post(
-                        f"{self._base_url}/api/generate-email",
-                        headers=self._headers,
-                        json=body,
-                    )
-                else:
-                    r = await client.get(
-                        f"{self._base_url}/api/generate-email",
-                        headers=self._headers,
-                    )
-                r.raise_for_status()
-                data = r.json()
+        async with httpx.AsyncClient(timeout=30) as client:
+            if body:
+                r = await client.post(
+                    f"{self._base_url}/api/generate-email",
+                    headers=self._headers,
+                    json=body,
+                )
+            else:
+                r = await client.get(
+                    f"{self._base_url}/api/generate-email",
+                    headers=self._headers,
+                )
+            r.raise_for_status()
+            data = r.json()
 
-            email = (
-                (data.get("data") or {}).get("email")
-                or data.get("email")
-            )
-            if not email:
-                raise ValueError(f"GPTMail: unexpected response: {data}")
+        email = (
+            (data.get("data") or {}).get("email")
+            or data.get("email")
+        )
+        if not email:
+            raise ValueError(f"GPTMail: unexpected response: {data}")
 
-            if self._is_valid_email(email):
-                logger.info(f"[GPTMail] Generated: {email}")
-                return email
-
-            logger.warning(
-                f"[GPTMail] Attempt {attempt}/{max_retries}: invalid domain in "
-                f"{email!r} — retrying"
-            )
-
-        raise ValueError(f"GPTMail: failed to generate a valid email after {max_retries} attempts")
+        logger.info(f"[GPTMail] Generated: {email}")
+        return email
 
     # ── poll ─────────────────────────────────────────────────────────────
 
