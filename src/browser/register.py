@@ -229,6 +229,7 @@ async def register_one(
                             birthday=birthday,
                             proxy=proxy,
                             timeouts=timeouts,
+                            mail_client=mail_client,
                         )
                         if token:
                             account.update(token.to_dict())
@@ -476,12 +477,30 @@ async def _state_machine(
 
     # ── STATE: FILL_PROFILE ───────────────────────────────────────────
     # tool.js: _0xbaf waits up to 60 s for firstName input; then calls _0xcc0(d)
+    # NOTE: Auth0 /about-you page uses input[name='name'] (single full-name), not
+    # separate firstName/lastName inputs.  Detect by URL first to avoid wasting
+    # the full profile_detect timeout on a page that never has firstName inputs.
     logger.info(f"[{task_id}] Checking for FILL_PROFILE page")
-    fname_result = await wait_any_element(
-        page, _FNAME_SELECTORS,
-        timeout_ms=int(timeouts.get("profile_detect", 15) * 1000),
-    )
-    if fname_result:
+    _profile_detect_ms = int(timeouts.get("profile_detect", 15) * 1000)
+    on_about_you = "about-you" in page.url or "about_you" in page.url
+
+    fname_result = None
+    if not on_about_you:
+        # Only look for separate firstName input when NOT on known about-you URL
+        fname_result = await wait_any_element(
+            page, _FNAME_SELECTORS, timeout_ms=_profile_detect_ms,
+        )
+
+    name_only_result = None
+    if not fname_result:
+        # Look for single name input (Auth0 /about-you layout)
+        name_only_result = await wait_any_element(
+            page,
+            ["input[name='name']", "input[name='fullName']", "input[type='text']"],
+            timeout_ms=5_000 if on_about_you else 3_000,
+        )
+
+    if fname_result or name_only_result or on_about_you:
         logger.info(f"[{task_id}] FILL_PROFILE — URL={page.url}")
         await _fill_profile(task_id, page, account, timeouts)
     else:
@@ -594,26 +613,34 @@ async def _fill_otp(page: Page, code: str) -> None:
 
 async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict) -> None:
     """
-    Fill name + birthday spinbuttons.
-    Mirrors tool.js _0xcc0(d):
-      • querySelector firstName/lastName inputs → _0x1c0
-      • querySelectorAll('[role="spinbutton"]') → _0x1d1(sb, value)
-      • querySelector 'button[type="submit"]' → click
+    Fill name + birthday spinbuttons on Auth0 /about-you page.
+
+    Supports two name-field layouts:
+      A) Separate firstName / lastName inputs  (old Auth0 style)
+      B) Single input[name='name'] full-name   (current Auth0 /about-you)
+
+    Spinbutton order is detected via aria-label + aria-valuemax — observed
+    real-world order is month → day → year (not year → month → day).
+    Mirrors oauth.py _fill_about_you_js() logic for consistency.
     """
     bd = account["birthday"]
     _pf_ms = int(timeouts.get("profile_field", 5) * 1000)
+    full_name = f"{account['firstName']} {account['lastName']}"
+    date_str  = f"{bd['year']}-{bd['month']:02d}-{bd['day']:02d}"
 
-    # Name fields
+    # ── Step 1: Fill name field(s) ────────────────────────────────────────────
     fname_result = await wait_any_element(page, _FNAME_SELECTORS, timeout_ms=_pf_ms)
     lname_result = await wait_any_element(page, _LNAME_SELECTORS, timeout_ms=_pf_ms)
 
     if fname_result and lname_result:
+        # Separate firstName / lastName inputs
         f_sel, _ = fname_result
         l_sel, _ = lname_result
         await set_react_input(page, f_sel, account["firstName"])
         await set_react_input(page, l_sel, account["lastName"])
+        logger.info(f"[{task_id}] Name filled via separate first/last inputs")
     else:
-        # Fallback: single full-name input
+        # Single full-name input (Auth0 /about-you)
         name_result = await wait_any_element(
             page,
             ["input[name='name']", "input[name='fullName']", "input[id*='name']"],
@@ -621,41 +648,90 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
         )
         if name_result:
             n_sel, _ = name_result
-            await set_react_input(
-                page, n_sel,
-                f"{account['firstName']} {account['lastName']}"
-            )
+            await set_react_input(page, n_sel, full_name)
+            logger.info(f"[{task_id}] Name filled via single name input {n_sel!r}: {full_name!r}")
         else:
-            logger.warning(f"[{task_id}] Name inputs not found — skipping")
+            # Last resort: JS fill first visible text input
+            await page.evaluate(f"""
+            () => {{
+                const BAD = new Set(['hidden','password','checkbox','radio',
+                                     'submit','button','file','image','reset']);
+                const inputs = Array.from(document.querySelectorAll('input')).filter(el => {{
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && !BAD.has(el.type);
+                }});
+                if (!inputs.length) return false;
+                const nv = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value');
+                nv.set.call(inputs[0], {repr(full_name)});
+                inputs[0].dispatchEvent(new Event('input',  {{bubbles:true}}));
+                inputs[0].dispatchEvent(new Event('change', {{bubbles:true}}));
+                inputs[0].dispatchEvent(new Event('blur',   {{bubbles:true}}));
+                return true;
+            }}
+            """)
+            logger.warning(f"[{task_id}] Name inputs not found by selector — tried JS fallback")
 
-    await asyncio.sleep(0.5)  # _0x1ae(0x1f4)
+    # Wait for conditional age/date inputs to appear after name is filled
+    await asyncio.sleep(1.5)
 
-    # Birthday spinbuttons: [role="spinbutton"] year / month / day
-    spinbuttons = page.locator("[role='spinbutton']")
-    sb_count    = await spinbuttons.count()
+    # ── Step 2: Fill birthday spinbuttons (label-aware, mirrors oauth.py) ─────
+    try:
+        sb_info = await page.evaluate("""
+            () => {
+                const sbs = Array.from(document.querySelectorAll('[role="spinbutton"]'));
+                return sbs.map((el, i) => ({
+                    idx:   i,
+                    label: (el.getAttribute('aria-label') || '').toLowerCase(),
+                    max:   parseInt(el.getAttribute('aria-valuemax') || '0', 10),
+                    now:   parseInt(el.getAttribute('aria-valuenow') || el.innerText || '0', 10),
+                }));
+            }
+        """)
+        logger.debug(f"[{task_id}] Profile spinbutton info: {sb_info}")
 
-    if sb_count >= 3:
-        logger.info(f"[{task_id}] Setting birthday via spinbuttons: {bd}")
-        await set_spinbutton(page, spinbuttons.nth(0), bd["year"])
-        await set_spinbutton(page, spinbuttons.nth(1), bd["month"])
-        await set_spinbutton(page, spinbuttons.nth(2), bd["day"])
-    else:
-        # Fallback: date input
-        date_str = (
-            f"{bd['year']}/{str(bd['month']).zfill(2)}/{str(bd['day']).zfill(2)}"
-        )
-        date_result = await wait_any_element(
-            page,
-            ["input[type='date']", "input[name*='birth']", "input[id*='birth']"],
-            timeout_ms=max(3_000, _pf_ms // 2),
-        )
-        if date_result:
-            d_sel, _ = date_result
-            await set_react_input(page, d_sel, date_str)
+        if sb_info and len(sb_info) >= 3:
+            def _detect_sb(info: dict) -> str:
+                label = info.get("label", "")
+                mx    = info.get("max", 0)
+                if "year"  in label or mx > 200:         return "year"
+                if "month" in label or (0 < mx <= 12):  return "month"
+                if "day"   in label or (12 < mx <= 31): return "day"
+                return "unknown"
+
+            field_order = [_detect_sb(sb) for sb in sb_info[:3]]
+            if set(field_order) != {"year", "month", "day"}:
+                # Default observed order on Auth0 /about-you: month → day → year
+                field_order = ["month", "day", "year"]
+            logger.info(f"[{task_id}] Birthday spinbutton order: {field_order} — {bd}")
+
+            for i, field in enumerate(field_order):
+                val = bd.get(field, 1)
+                await set_spinbutton(page, page.locator("[role='spinbutton']").nth(i), val)
+                logger.debug(f"[{task_id}] Spinbutton[{i}] {field}={val} done")
+
+        else:
+            # Fewer than 3 spinbuttons — try date input fallback
+            logger.debug(
+                f"[{task_id}] Only {len(sb_info) if sb_info else 0} spinbutton(s) — "
+                "trying date input fallback"
+            )
+            date_found = False
+            for sel in ["input[type='date']", "input[name*='birth']", "input[id*='birth']"]:
+                if await is_visible(page, sel):
+                    await set_react_input(page, sel, date_str)
+                    logger.info(f"[{task_id}] Birthday via date selector {sel!r}: {date_str}")
+                    date_found = True
+                    break
+            if not date_found:
+                logger.warning(f"[{task_id}] Birthday input not found — skipping")
+
+    except Exception as _e:
+        logger.warning(f"[{task_id}] Spinbutton fill error: {_e}")
 
     await asyncio.sleep(0.5)
 
-    # Submit profile
+    # ── Step 3: Submit profile form ───────────────────────────────────────────
     submitted = await click_submit_or_text(
         page, ["Continue", "Agree", "同意", "Next", "Finish", "Done", "继续"]
     )

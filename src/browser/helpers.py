@@ -14,6 +14,8 @@ from loguru import logger
 from typing import Literal
 from playwright.async_api import Page, Locator, TimeoutError as PWTimeoutError
 
+import src.config as _cfg_mod
+
 # ── React-compatible input fill ───────────────────────────────────────────
 
 _REACT_INPUT_JS = """
@@ -21,21 +23,32 @@ _REACT_INPUT_JS = """
     const [selector, value] = args;
     const el = document.querySelector(selector);
     if (!el) return false;
-    el.focus();
-    // Trigger React's synthetic onChange via nativeInputValueSetter
-    const setter = Object.getOwnPropertyDescriptor(
+
+    const nativeSetter = Object.getOwnPropertyDescriptor(
         window.HTMLInputElement.prototype, 'value'
     ).set;
-    setter.call(el, value);
-    el.dispatchEvent(new Event('input',  { bubbles: true, composed: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    // Also dispatch key events for each character (some forms require it)
+
+    // Focus and clear existing value
+    el.focus();
+    el.click();
+    nativeSetter.call(el, '');
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: '' }));
+
+    // Type character-by-character to trigger per-keystroke React validation.
+    // Auth0 password fields keep the submit button disabled unless each keydown
+    // → nativeSetter → InputEvent('input') sequence fires per character.
+    let cur = '';
     for (const ch of value) {
-        el.dispatchEvent(new KeyboardEvent('keydown',  {key: ch, bubbles: true}));
-        el.dispatchEvent(new KeyboardEvent('keypress', {key: ch, bubbles: true}));
-        el.dispatchEvent(new KeyboardEvent('keyup',    {key: ch, bubbles: true}));
+        el.dispatchEvent(new KeyboardEvent('keydown',  { key: ch, bubbles: true, cancelable: true, composed: true }));
+        el.dispatchEvent(new KeyboardEvent('keypress', { key: ch, bubbles: true, cancelable: true, composed: true }));
+        cur += ch;
+        nativeSetter.call(el, cur);
+        el.dispatchEvent(new InputEvent('input',  { bubbles: true, composed: true, data: ch, inputType: 'insertText' }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup',    { key: ch, bubbles: true, cancelable: true, composed: true }));
     }
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
+
+    el.dispatchEvent(new Event('blur',  { bubbles: true }));
     el.focus();
     return true;
 }
@@ -45,7 +58,12 @@ _REACT_INPUT_JS = """
 async def set_react_input(page: Page, selector: str, value: str) -> bool:
     """
     Fill an input element in a way that triggers React's onChange.
-    Falls back to playwright's built-in fill() if the JS approach fails.
+
+    Primary path: JS character-by-character approach (keydown → nativeSetter →
+    InputEvent per char) so Auth0's per-keystroke React validation fires correctly.
+
+    Fallback 1: Playwright press_sequentially (real browser key events per char).
+    Fallback 2: Playwright fill() (bulk set — last resort, may leave button disabled).
     """
     try:
         ok = await page.evaluate(_REACT_INPUT_JS, [selector, value])
@@ -54,7 +72,18 @@ async def set_react_input(page: Page, selector: str, value: str) -> bool:
     except Exception as exc:
         logger.debug(f"[helpers] JS fill failed for {selector!r}: {exc}")
 
-    # Fallback: use Playwright locator directly
+    # Fallback 1: press_sequentially fires native key events per character
+    try:
+        el = page.locator(selector).first
+        await el.click()
+        await el.press("Control+a")
+        await el.press("Delete")
+        await el.press_sequentially(value, delay=40)
+        return True
+    except Exception as exc:
+        logger.debug(f"[helpers] press_sequentially fallback failed for {selector!r}: {exc}")
+
+    # Fallback 2: bulk fill (may not enable disabled submit buttons)
     try:
         el = page.locator(selector).first
         await el.fill(value)
@@ -62,6 +91,32 @@ async def set_react_input(page: Page, selector: str, value: str) -> bool:
     except Exception as exc:
         logger.warning(f"[helpers] fill fallback failed for {selector!r}: {exc}")
         return False
+
+
+async def wait_button_enabled(
+    page: Page,
+    selector: str = "button[type='submit']",
+    timeout_ms: int = 5_000,
+) -> bool:
+    """
+    Poll until the first visible button matching *selector* is not disabled.
+    Returns True if the button becomes enabled within the timeout, else False.
+    Useful for verifying that React form validation has accepted the input.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    while loop.time() < deadline:
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible():
+                disabled      = await el.get_attribute("disabled")
+                aria_disabled = await el.get_attribute("aria-disabled")
+                if disabled is None and aria_disabled != "true":
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return False
 
 
 # ── Element waiting ───────────────────────────────────────────────────────
@@ -219,29 +274,56 @@ async def find_signup_button(task_id: str, page: Page) -> Optional[Locator]:
 
 async def set_spinbutton(page: Page, locator: Locator, target: int) -> None:
     """
-    Adjust a spinbutton (role='spinbutton') to reach *target* by pressing
-    ArrowUp / ArrowDown keys, mirroring the original JS _0x1d1 logic.
+    Adjust a spinbutton (role='spinbutton') to reach *target* using ArrowUp/ArrowDown.
+    Mirrors JS _0x1d1 exactly:
+      1. Focus + click, wait 200ms
+      2. If no digit in textContent, send ArrowDown once to activate (100ms)
+      3. Loop up to 100 iterations: re-read value each time, ArrowUp/ArrowDown to adjust
+      4. After loop: force-set aria-valuenow + dispatch change + blur events
     """
+    await locator.focus()
     await locator.click()
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.2)   # 0xc8 = 200ms
 
-    # Read current value
-    current_str: str = await locator.evaluate(
-        "el => el.getAttribute('aria-valuenow') || el.textContent || '0'"
-    )
-    try:
-        current = int("".join(c for c in current_str if c.isdigit() or c == "-"))
-    except ValueError:
-        current = 0
+    # Step 1: If no digit visible, send ArrowDown once to activate (mirrors _0x1d1)
+    content: str = await locator.evaluate("el => el.textContent || ''")
+    if not any(c.isdigit() for c in content):
+        await locator.press("ArrowDown")
+        await asyncio.sleep(0.1)   # 0x64 = 100ms
 
-    diff = target - current
-    key  = "ArrowUp" if diff > 0 else "ArrowDown"
-    for _ in range(abs(diff)):
+    # Step 2: Loop up to 100 iterations (m = 0x64 in tool.js)
+    for _ in range(100):
+        text: str = await locator.evaluate(
+            "el => el.textContent || el.getAttribute('aria-valuenow') || ''"
+        )
+        digits = "".join(c for c in text if c.isdigit())
+        if not digits:
+            # Still no digit — keep pressing ArrowDown to activate
+            await locator.press("ArrowDown")
+            await asyncio.sleep(0.1)
+            continue
+        try:
+            current = int(digits)
+        except ValueError:
+            continue
+
+        diff = target - current
+        if diff == 0:
+            break
+        key = "ArrowUp" if diff > 0 else "ArrowDown"
         await locator.press(key)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.08)   # 0x50 = 80ms
 
-    # Confirm the value
-    await locator.press("Tab")
+    # Step 3: Force-set aria-valuenow + dispatch change/blur (mirrors _0x1d1 end)
+    await locator.evaluate(
+        "(el, v) => {"
+        "  el.setAttribute('aria-valuenow', String(v));"
+        "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+        "  el.dispatchEvent(new Event('blur', {bubbles: true}));"
+        "}",
+        target,
+    )
+    await asyncio.sleep(0.1)   # 0x64 = 100ms
 
 
 # ── Error page detection ──────────────────────────────────────────────────
@@ -284,7 +366,27 @@ async def human_move_and_click(page: Page, locator: Locator) -> None:
 
     Auth0 / Cloudflare track mouse history before a click; a direct
     playwright .click() with no prior movement is a strong bot signal.
+
+    All timing/step parameters are read from config.yaml under the ``mouse:``
+    key so they can be tuned without touching source code:
+
+        mouse:
+          steps_min:       4      # min micro-steps along arc
+          steps_max:       8      # max micro-steps along arc
+          step_delay_min:  0.003  # min sleep per step (seconds)
+          step_delay_max:  0.010  # max sleep per step (seconds)
+          hover_min:       0.02   # min hover pause before click (seconds)
+          hover_max:       0.08   # max hover pause before click (seconds)
     """
+    # Load mouse-movement config (falls back to defaults if key absent)
+    _mc = _cfg_mod.get("mouse") or {}
+    steps_min      = float(_mc.get("steps_min",      4))
+    steps_max      = float(_mc.get("steps_max",      8))
+    step_dmin      = float(_mc.get("step_delay_min", 0.003))
+    step_dmax      = float(_mc.get("step_delay_max", 0.010))
+    hover_min      = float(_mc.get("hover_min",      0.02))
+    hover_max      = float(_mc.get("hover_max",      0.08))
+
     try:
         box = await locator.bounding_box()
         if not box:
@@ -300,17 +402,17 @@ async def human_move_and_click(page: Page, locator: Locator) -> None:
         start_y = random.randint(150, 600)
 
         # Move in N micro-steps with ease-in-out + slight per-step noise
-        steps = random.randint(8, 16)
+        steps = random.randint(int(steps_min), int(steps_max))
         for i in range(1, steps + 1):
             t = i / steps
             t = t * t * (3.0 - 2.0 * t)          # smoothstep easing
             x = start_x + (target_x - start_x) * t + random.uniform(-2, 2)
             y = start_y + (target_y - start_y) * t + random.uniform(-2, 2)
             await page.mouse.move(x, y)
-            await asyncio.sleep(random.uniform(0.008, 0.025))
+            await asyncio.sleep(random.uniform(step_dmin, step_dmax))
 
         # Brief human "hover" pause before pressing
-        await asyncio.sleep(random.uniform(0.05, 0.18))
+        await asyncio.sleep(random.uniform(hover_min, hover_max))
         await page.mouse.click(target_x, target_y)
 
     except Exception as exc:

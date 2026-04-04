@@ -37,6 +37,7 @@ from src.browser.helpers import (
     set_react_input,
     click_submit_or_text,
 )
+from src.mail.base import MailClient
 
 # ── OAuth constants (mirrors plan/chatgpt_register_sentinel.py defaults) ────
 OAUTH_ISSUER       = "https://auth.openai.com"
@@ -160,6 +161,7 @@ async def acquire_tokens_via_browser(
     proxy: Optional[str] = None,
     timeout: float = 45.0,
     timeouts: Optional[dict] = None,
+    mail_client: Optional[MailClient] = None,
 ) -> Optional[TokenResult]:
     """
     Use the browser's existing authenticated session to perform a Codex PKCE
@@ -169,20 +171,22 @@ async def acquire_tokens_via_browser(
     registration flow has just completed on the same page context).
 
     Args:
-        page:       Playwright page with an active OpenAI auth session.
-        email:      The registered e-mail (used to label the token result).
-        password:   Account password — used if Auth0 shows the login page.
-        first_name: First name — used to fill about-you form if encountered.
-        last_name:  Last name — used to fill about-you form if encountered.
-        birthday:   Dict {year, month, day} — used to fill about-you form.
-        proxy:      Optional HTTP proxy URL for the token-exchange request.
-        timeout:    Hard deadline (seconds) for the entire OAuth flow.
-                    Overridden by ``timeouts["oauth_total"]`` when provided.
-        timeouts:   Per-stage timeout dict (from cfg["timeouts"]).  All values
-                    are in seconds.  Keys used here:
-                      oauth_total, oauth_navigate, oauth_login_email,
-                      oauth_login_password, oauth_flow_element,
-                      oauth_token_exchange.
+        page:         Playwright page with an active OpenAI auth session.
+        email:        The registered e-mail (used to label the token result).
+        password:     Account password — used if Auth0 shows the login page.
+        first_name:   First name — used to fill about-you form if encountered.
+        last_name:    Last name — used to fill about-you form if encountered.
+        birthday:     Dict {year, month, day} — used to fill about-you form.
+        proxy:        Optional HTTP proxy URL for the token-exchange request.
+        timeout:      Hard deadline (seconds) for the entire OAuth flow.
+                      Overridden by ``timeouts["oauth_total"]`` when provided.
+        timeouts:     Per-stage timeout dict (from cfg["timeouts"]).  All values
+                      are in seconds.  Keys used here:
+                        oauth_total, oauth_navigate, oauth_login_email,
+                        oauth_login_password, oauth_flow_element,
+                        oauth_token_exchange, otp_code.
+        mail_client:  Optional mail client used to poll for the email OTP when
+                      Auth0 demands email verification after password login.
 
     Returns:
         ``TokenResult`` on success, ``None`` on any failure (always non-fatal).
@@ -277,6 +281,10 @@ async def acquire_tokens_via_browser(
                         page, ["Continue", "Login", "Sign in", "Submit", "继续"]
                     )
                     await asyncio.sleep(3.0)
+
+                    # ── Handle email OTP verification (if Auth0 requires it) ──────
+                    if mail_client:
+                        await _handle_oauth_otp(page, email, mail_client, _to)
                 else:
                     logger.warning("[oauth] Password input not found on login page")
             else:
@@ -333,6 +341,98 @@ async def acquire_tokens_via_browser(
         except Exception:
             pass
 
+
+
+# ── OAuth OTP handling ────────────────────────────────────────────────────────
+
+async def _handle_oauth_otp(
+    page: Page,
+    email: str,
+    mail_client: MailClient,
+    timeouts: dict,
+) -> None:
+    """
+    After the OAuth login page password submit, detect whether Auth0 shows an
+    email OTP verification step and, if so, poll the mailbox for the code,
+    fill it, then click Continue.
+
+    OTP input detection mirrors register.py ``_wait_for_otp_inputs``:
+      - ≥ 4 individual maxlength=1 boxes  → fill digit-by-digit
+      - single autocomplete="one-time-code" / name="code" input → React fill
+
+    The inbox polling timeout is taken from ``timeouts["otp_code"]`` (default
+    180 s, same key used by the registration flow).
+    """
+    # ── Detect OTP inputs (quick non-blocking scan, up to ~5 s) ──────────────
+    _OTP_BOX  = "input[type='text'][maxlength='1'], input[maxlength='1']"
+    _OTP_SINGLE = [
+        "input[autocomplete='one-time-code']",
+        "input[name='code']",
+        "input[id*='code']",
+    ]
+
+    otp_detected = False
+    for _ in range(10):          # 10 × 0.5 s = 5 s window
+        try:
+            count = await page.locator(_OTP_BOX).count()
+            if count >= 4:
+                otp_detected = True
+                break
+        except Exception:
+            pass
+        for sel in _OTP_SINGLE:
+            try:
+                if await page.locator(sel).first.is_visible():
+                    otp_detected = True
+                    break
+            except Exception:
+                pass
+        if otp_detected:
+            break
+        await asyncio.sleep(0.5)
+
+    if not otp_detected:
+        logger.debug("[oauth] No OTP input detected after password submit — skipping OTP step")
+        return
+
+    logger.info(f"[oauth] Email OTP required — polling inbox for {email}")
+
+    # ── Poll mailbox ──────────────────────────────────────────────────────────
+    otp_timeout = int(timeouts.get("otp_code", 180))
+    code = await mail_client.poll_code(email, timeout=otp_timeout)
+
+    if not code:
+        logger.warning(f"[oauth] OTP code not received within {otp_timeout}s — continuing without fill")
+        return
+
+    logger.info(f"[oauth] OTP code received — filling: {code}")
+
+    # ── Fill OTP inputs (mirrors register.py _fill_otp) ──────────────────────
+    try:
+        boxes = page.locator(_OTP_BOX)
+        count = await boxes.count()
+        if count >= 4:
+            for i, ch in enumerate(code[:count]):
+                box = boxes.nth(i)
+                try:
+                    await box.click()
+                except Exception:
+                    pass
+                await box.fill(ch)
+                await asyncio.sleep(0.1)
+        else:
+            for sel in _OTP_SINGLE:
+                ok = await set_react_input(page, sel, code)
+                if ok:
+                    break
+    except Exception as exc:
+        logger.warning(f"[oauth] OTP fill error: {exc}")
+        return
+
+    await asyncio.sleep(1.0)
+    await click_submit_or_text(page, ["Continue", "Verify", "Submit", "继续"])
+    await asyncio.sleep(3.0)
+    logger.info(f"[oauth] OTP submitted — continuing OAuth flow")
 
 
 # ── About-you profile fill helper ────────────────────────────────────────────

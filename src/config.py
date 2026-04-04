@@ -31,6 +31,16 @@ _DEFAULTS: dict[str, Any] = {
     "enable_oauth": True,
     # ── Per-stage timeout configuration (all values in seconds) ──────────────
     # Override any value in config.yaml under the `timeouts:` key.
+    # ── Human mouse-movement simulation ──────────────────────────────────────
+    # Reduce these values to speed up clicks; increase to appear more human-like.
+    "mouse": {
+        "steps_min":       4,     # min micro-steps along the movement arc
+        "steps_max":       8,     # max micro-steps along the movement arc
+        "step_delay_min":  0.003, # min sleep per step (seconds)
+        "step_delay_max":  0.010, # max sleep per step (seconds)
+        "hover_min":       0.02,  # min hover pause before the click (seconds)
+        "hover_max":       0.08,  # max hover pause before the click (seconds)
+    },
     "timeouts": {
         # Registration flow
         "page_load":            30,   # page.goto() for login / retry navigations
