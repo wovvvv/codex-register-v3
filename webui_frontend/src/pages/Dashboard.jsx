@@ -4,6 +4,37 @@ import { useNavigate } from 'react-router-dom'
 import api from '../lib/api.js'
 import { StatusBadge, Spinner } from '../components/Badge.jsx'
 
+function useProviderOptions() {
+  const [opts, setOpts] = useState([['imap:0', 'IMAP 服务商 1']])
+  useEffect(() => {
+    api.getSettings().then(s => {
+      const items = []
+      const imapProviders = Array.isArray(s['mail.imap']) ? s['mail.imap'] : []
+      const isNewFormat = imapProviders.length > 0 && 'accounts' in imapProviders[0]
+
+      if (isNewFormat) {
+        imapProviders.forEach((prov, i) => {
+          const name  = prov.name || `IMAP 服务商 ${i + 1}`
+          const count = Array.isArray(prov.accounts) ? prov.accounts.length : 0
+          items.push([`imap:${i}`, `${name} (${count} 账户)`])
+        })
+      } else {
+        imapProviders.forEach((acc, i) =>
+          items.push([`imap:${i}`, acc.email ? `IMAP: ${acc.email}` : `IMAP 账户 ${i + 1}`]))
+      }
+      if (!items.length) items.push(['imap:0', 'IMAP 服务商 1'])
+
+      const outlookAccounts = Array.isArray(s['mail.outlook']) ? s['mail.outlook'] : []
+      if (outlookAccounts.length > 0) {
+        items.push(['outlook', `Outlook (${outlookAccounts.length} 账户)`])
+      }
+      items.push(['gptmail', 'GptMail'], ['npcmail', 'NpcMail'], ['yydsmail', 'YYDSMail'])
+      setOpts(items)
+    }).catch(() => {})
+  }, [])
+  return opts
+}
+
 function StatCard({ label, value, sub, color = 'blue', icon }) {
   const ring = {
     blue:  'border-l-blue-500',
@@ -34,6 +65,7 @@ export function Dashboard() {
   const [starting, setStarting] = useState(false)
   const [msg, setMsg]       = useState('')
   const navigate = useNavigate()
+  const providerOpts = useProviderOptions()
 
   useEffect(() => {
     const load = () => {
@@ -113,11 +145,7 @@ export function Dashboard() {
                 onChange={e => setForm(f => ({ ...f, provider: e.target.value }))}
                 className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
               >
-                <option value="imap:0">IMAP 账户 1</option>
-                <option value="imap:1">IMAP 账户 2</option>
-                <option value="gptmail">GptMail</option>
-                <option value="npcmail">NpcMail</option>
-                <option value="yydsmail">YYDSMail</option>
+                {providerOpts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
               </select>
             </label>
             {msg && <p className="text-xs text-blue-600">{msg}</p>}

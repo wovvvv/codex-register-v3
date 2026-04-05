@@ -10,16 +10,41 @@ from src.mail.gptmail import GPTMailClient
 from src.mail.npcmail import NPCMailClient
 from src.mail.yydsmail import YYDSMailClient
 from src.mail.imap import IMAPMailClient, MultiIMAPMailClient
+from src.mail.outlook import OutlookMailClient, MultiOutlookMailClient
 
 __all__ = [
     "MailClient", "GPTMailClient", "NPCMailClient",
     "YYDSMailClient", "IMAPMailClient", "MultiIMAPMailClient",
+    "OutlookMailClient", "MultiOutlookMailClient",
     "get_mail_client",
 ]
 
 
-def get_mail_client(provider: str, api_key: str = "", base_url: str = "") -> MailClient:
-    """Return the appropriate MailClient for *provider*."""
+def get_mail_client(
+    provider: str,
+    api_key: str = "",
+    base_url: str = "",
+    cfg: Optional[dict] = None,
+) -> MailClient:
+    """
+    Return the appropriate MailClient for *provider*.
+
+    Parameters
+    ----------
+    provider : Provider name, e.g. 'gptmail', 'imap', 'imap:0', 'outlook', 'outlook:1'.
+    api_key  : API key for HTTP-based providers (gptmail / npcmail / yydsmail).
+    base_url : Base URL for HTTP-based providers.
+    cfg      : Full merged config dict (from settings_db.build_config()).
+               When provided, IMAP/Outlook accounts are read from here instead
+               of config.yaml.  Falls back to config.yaml when None.
+    """
+    # Lazy-load config only if not supplied by caller.
+    def _get_cfg() -> dict:
+        if cfg is not None:
+            return cfg
+        import src.config as _c
+        return _c.load()
+
     match provider.lower():
         case "gptmail":
             return GPTMailClient(
@@ -36,53 +61,92 @@ def get_mail_client(provider: str, api_key: str = "", base_url: str = "") -> Mai
                 api_key=api_key,
                 **({"base_url": base_url} if base_url else {}),
             )
+
+        # ── IMAP ──────────────────────────────────────────────────────────
         case _ if provider.lower() == "imap" or provider.lower().startswith("imap:"):
-            # Support "imap" (random from all) or "imap:N" (fixed index N).
             _parts = provider.split(":", 1)
             _index: Optional[int] = None
             if len(_parts) == 2 and _parts[1].isdigit():
                 _index = int(_parts[1])
 
-            import src.config as _cfg_mod
-            _imap_raw = (_cfg_mod.load().get("mail") or {}).get("imap", [])
-
-            # Backward compat: accept a single dict (old config format).
+            _imap_raw = (_get_cfg().get("mail") or {}).get("imap", [])
             if isinstance(_imap_raw, dict):
                 _imap_raw = [_imap_raw]
 
-            # Build one IMAPMailClient per configured account, skipping blanks.
             _clients = [
                 IMAPMailClient(
-                    email     = c.get("email", ""),
-                    password  = c.get("password", ""),
-                    host      = c.get("host", ""),
-                    port      = int(c.get("port", 993)),
-                    ssl       = bool(c.get("ssl", True)),
-                    folder    = c.get("folder", "INBOX"),
-                    use_alias = c.get("use_alias"),  # None → auto-detect by domain
+                    email        = c.get("email", ""),
+                    password     = c.get("password", ""),
+                    host         = c.get("host", ""),
+                    port         = int(c.get("port", 993)),
+                    ssl          = bool(c.get("ssl", True)),
+                    folder       = c.get("folder", "INBOX"),
+                    use_alias    = c.get("use_alias"),
+                    auth_type    = c.get("auth_type", "password"),
+                    access_token = c.get("access_token", ""),
                 )
                 for c in _imap_raw
-                if c.get("email")   # skip placeholder / empty entries
+                if c.get("email")
             ]
 
             if not _clients:
                 raise ValueError(
                     "No valid IMAP accounts configured. "
-                    "Add at least one entry with a non-empty 'email' under mail.imap."
+                    "Add at least one entry under Settings → IMAP 账户."
                 )
 
-            # Fixed-index mode: "imap:0", "imap:1", …
             if _index is not None:
                 if _index >= len(_clients):
                     raise ValueError(
-                        f"mail_provider: imap:{_index} 越界 — "
-                        f"共配置了 {len(_clients)} 个账户 (有效索引 0–{len(_clients) - 1})"
+                        f"imap:{_index} out of range — "
+                        f"{len(_clients)} account(s) configured (index 0–{len(_clients) - 1})"
                     )
                 return _clients[_index]
 
-            # Random / all-accounts mode: "imap"
             return _clients[0] if len(_clients) == 1 else MultiIMAPMailClient(_clients)
+
+        # ── Outlook / Hotmail ─────────────────────────────────────────────
+        case _ if provider.lower() in ("outlook", "hotmail") or provider.lower().startswith("outlook:"):
+            _parts = provider.split(":", 1)
+            _index = None
+            if len(_parts) == 2 and _parts[1].isdigit():
+                _index = int(_parts[1])
+
+            _out_raw = (_get_cfg().get("mail") or {}).get("outlook", [])
+            if isinstance(_out_raw, dict):
+                _out_raw = [_out_raw]
+
+            _clients_out = [
+                OutlookMailClient(
+                    email         = c.get("email", ""),
+                    client_id     = c.get("client_id", ""),
+                    tenant_id     = c.get("tenant_id", "consumers"),
+                    refresh_token = c.get("refresh_token", ""),
+                    access_token  = c.get("access_token", ""),
+                    fetch_method  = c.get("fetch_method", "graph"),
+                )
+                for c in _out_raw
+                if c.get("email") and c.get("client_id")
+            ]
+
+            if not _clients_out:
+                raise ValueError(
+                    "No valid Outlook accounts configured. "
+                    "Add at least one entry under Settings → Outlook/Hotmail."
+                )
+
+            if _index is not None:
+                if _index >= len(_clients_out):
+                    raise ValueError(
+                        f"outlook:{_index} out of range — "
+                        f"{len(_clients_out)} account(s) configured"
+                    )
+                return _clients_out[_index]
+
+            return _clients_out[0] if len(_clients_out) == 1 else MultiOutlookMailClient(_clients_out)
 
         case _:
             raise ValueError(f"Unknown mail provider: {provider!r}")
+
+
 

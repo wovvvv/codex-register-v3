@@ -1,5 +1,5 @@
 """
-mail/imap.py — Generic IMAP mailbox client (supports multiple accounts & alias mode).
+mail/imap.py — Generic IMAP mailbox client (supports multiple accounts, alias mode, OAuth2).
 
 Unlike the API-based providers (gptmail / yydsmail), this client connects
 directly to any standard IMAP server using the account's own credentials.
@@ -34,6 +34,7 @@ CLI smoke-test:
 from __future__ import annotations
 
 import asyncio
+import base64
 import email as email_lib
 import random
 import re
@@ -49,8 +50,21 @@ from src.mail.base import MailClient
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
-# Domains that natively support "+" subaddressing (alias mode auto-enabled).
 _ALIAS_DOMAINS: frozenset[str] = frozenset({"qq.com", "gmail.com"})
+
+# Well-known IMAP hosts auto-detected from email domain.
+_AUTO_HOSTS: dict[str, str] = {
+    "gmail.com":    "imap.gmail.com",
+    "qq.com":       "imap.qq.com",
+    "foxmail.com":  "imap.qq.com",
+    "163.com":      "imap.163.com",
+    "126.com":      "imap.126.com",
+    "yeah.net":     "imap.yeah.net",
+    "hotmail.com":  "imap-mail.outlook.com",
+    "outlook.com":  "imap-mail.outlook.com",
+    "live.com":     "imap-mail.outlook.com",
+    "msn.com":      "imap-mail.outlook.com",
+}
 
 _CODE_RE          = re.compile(r"\b(\d{6})\b")
 _CODE_FALLBACK_RE = re.compile(r"\b(\d{4,8})\b")
@@ -105,6 +119,12 @@ def _random_alias(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
+def _make_xoauth2_token(email: str, access_token: str) -> str:
+    """Build the base64-encoded XOAUTH2 SASL token for IMAP authentication."""
+    raw = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
+    return base64.b64encode(raw.encode()).decode()
+
+
 # ── Single-account IMAP client ────────────────────────────────────────────
 
 class IMAPMailClient(MailClient):
@@ -113,37 +133,40 @@ class IMAPMailClient(MailClient):
 
     Parameters
     ----------
-    email     : The full e-mail address (used for IMAP login).
-    password  : IMAP account password.
-    host      : IMAP server hostname.
-    port      : 993 for IMAPS (SSL), 143 for STARTTLS / plain.
-    ssl       : True → IMAPS (recommended); False → plain/STARTTLS.
-    folder    : Mailbox folder to poll (default "INBOX").
-    use_alias : True  → always generate a '+alias' address.
-                False → always return the bare address.
-                None  → auto-detect: enabled for qq.com and gmail.com.
+    email        : Full e-mail address used for login.
+    password     : IMAP password (ignored when auth_type='oauth2').
+    host         : IMAP server. Auto-detected from domain when empty.
+    port         : 993 = IMAPS (SSL), 143 = STARTTLS.
+    ssl          : True → IMAPS; False → plain/STARTTLS.
+    folder       : Mailbox folder (default 'INBOX').
+    use_alias    : None = auto-detect (qq.com/gmail.com), True/False = override.
+    auth_type    : 'password' (default) or 'oauth2' (XOAUTH2).
+    access_token : Bearer token required when auth_type='oauth2'.
     """
 
     def __init__(
         self,
         email: str,
-        password: str,
-        host: str,
+        password: str = "",
+        host: str = "",
         port: int = 993,
         ssl: bool = True,
         folder: str = "INBOX",
         use_alias: Optional[bool] = None,
+        auth_type: str = "password",
+        access_token: str = "",
     ) -> None:
-        self._email    = email
-        self._password = password
-        self._host     = host
-        self._port     = port
-        self._ssl      = ssl
-        self._folder   = folder
+        self._email        = email
+        self._password     = password
+        self._host         = host or _AUTO_HOSTS.get(email.split("@")[-1].lower() if "@" in email else "", "")
+        self._port         = port
+        self._ssl          = ssl
+        self._folder       = folder
+        self._auth_type    = auth_type
+        self._access_token = access_token
 
-        # Auto-detect alias mode from domain when use_alias is not set explicitly.
         if use_alias is None:
-            domain = email.split("@")[-1].lower() if "@" in email else ""
+            domain    = email.split("@")[-1].lower() if "@" in email else ""
             use_alias = domain in _ALIAS_DOMAINS
         self._use_alias: bool = use_alias
 
@@ -217,7 +240,11 @@ class IMAPMailClient(MailClient):
                     )
 
                 await imap.wait_hello_from_server()
-                ok, _ = await imap.login(self._email, self._password)
+                if self._auth_type == "oauth2":
+                    token = _make_xoauth2_token(self._email, self._access_token)
+                    ok, _ = await imap.authenticate("XOAUTH2", lambda x: token.encode())
+                else:
+                    ok, _ = await imap.login(self._email, self._password)
                 if ok != "OK":
                     logger.warning(f"[IMAP] Login failed: {ok}")
                     await asyncio.sleep(poll_interval)

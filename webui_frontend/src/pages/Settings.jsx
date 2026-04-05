@@ -5,11 +5,12 @@ import { Spinner } from '../components/Badge.jsx'
 
 // ── Shared helpers ────────────────────────────────────────────────────────
 
-function Section({ title, children }) {
+function Section({ title, desc, children }) {
   return (
     <div className="border border-gray-100 rounded-xl overflow-hidden">
       <div className="bg-gray-50 px-5 py-3 border-b border-gray-100">
         <h4 className="text-sm font-semibold text-gray-700">{title}</h4>
+        {desc && <p className="text-xs text-gray-400 mt-0.5">{desc}</p>}
       </div>
       <div className="p-5">{children}</div>
     </div>
@@ -28,11 +29,11 @@ function Field({ label, hint, children }) {
   )
 }
 
-function Input({ type = 'text', ...props }) {
+function Input({ type = 'text', className = '', ...props }) {
   return (
     <input
       type={type}
-      className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+      className={`block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 ${className}`}
       {...props}
     />
   )
@@ -82,42 +83,132 @@ function useSave() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved]   = useState(false)
   const [error, setError]   = useState('')
-
   const run = async (fn) => {
     setSaving(true); setSaved(false); setError('')
-    try {
-      await fn()
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2500)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setSaving(false)
-    }
+    try { await fn(); setSaved(true); setTimeout(() => setSaved(false), 2500) }
+    catch (e) { setError(e.message) }
+    finally { setSaving(false) }
   }
   return { saving, saved, error, run }
 }
 
-// ── Tab: General (YAML-backed) ─────────────────────────────────────────────
+// ── Import Modal ──────────────────────────────────────────────────────────
+
+function ImportModal({ title, placeholder, hint, onParse, onImport, onClose }) {
+  const [text,   setText]   = useState('')
+  const [parsed, setParsed] = useState([])
+  const [err,    setErr]    = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const parse = async () => {
+    setErr('')
+    try {
+      const result = await onParse(text)
+      setParsed(result)
+    } catch (e) {
+      setErr(e.message || String(e))
+      setParsed([])
+    }
+  }
+
+  const confirm = async () => {
+    setSaving(true)
+    try { await onImport(parsed); onClose() }
+    catch (e) { setErr(e.message) }
+    finally { setSaving(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl flex flex-col max-h-[90vh]">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">{title}</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+        </div>
+
+        <div className="p-6 flex-1 overflow-y-auto space-y-4">
+          {hint && (
+            <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 whitespace-pre-wrap font-mono leading-relaxed">
+              {hint}
+            </div>
+          )}
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            placeholder={placeholder}
+            rows={8}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+          <button
+            onClick={parse}
+            disabled={!text.trim()}
+            className="bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            解析预览
+          </button>
+
+          {err && <p className="text-xs text-red-500">{err}</p>}
+
+          {parsed.length > 0 && (
+            <div>
+              <p className="text-sm font-medium text-gray-700 mb-2">
+                解析成功 <span className="text-blue-600 font-bold">{parsed.length}</span> 条
+              </p>
+              <div className="border border-gray-100 rounded-lg overflow-auto max-h-48">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      {Object.keys(parsed[0])
+                        .filter(k => !['access_token','refresh_token','password'].includes(k))
+                        .map(k => <th key={k} className="px-3 py-2 text-left text-gray-500 font-medium">{k}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-50">
+                    {parsed.map((row, i) => (
+                      <tr key={i}>
+                        {Object.entries(row)
+                          .filter(([k]) => !['access_token','refresh_token','password'].includes(k))
+                          .map(([k, v]) => <td key={k} className="px-3 py-1.5 text-gray-600 font-mono">{String(v)}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">取消</button>
+          <button
+            onClick={confirm}
+            disabled={!parsed.length || saving}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors"
+          >
+            {saving && <Spinner />}
+            {saving ? '添加中…' : `添加 ${parsed.length} 条`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Tab: General ──────────────────────────────────────────────────────────
 
 function TabGeneral() {
   const [cfg, setCfg] = useState(null)
   const { saving, saved, error, run } = useSave()
 
   useEffect(() => { api.getConfig().then(setCfg).catch(() => {}) }, [])
-
   const set = (k, v) => setCfg(c => ({ ...c, [k]: v }))
 
   const save = () => run(async () => {
     await api.saveConfig({
-      engine:          cfg.engine,
-      headless:        cfg.headless,
-      mobile:          cfg.mobile,
-      max_concurrent:  cfg.max_concurrent,
-      slow_mo:         cfg.slow_mo,
-      mail_provider:   cfg.mail_provider,
-      proxy_strategy:  cfg.proxy_strategy,
-      proxy_static:    cfg.proxy_static ?? '',
+      engine: cfg.engine, headless: cfg.headless, mobile: cfg.mobile,
+      max_concurrent: cfg.max_concurrent, slow_mo: cfg.slow_mo,
+      mail_provider: cfg.mail_provider, proxy_strategy: cfg.proxy_strategy,
+      proxy_static: cfg.proxy_static ?? '',
     })
   })
 
@@ -130,72 +221,55 @@ function TabGeneral() {
           <Select value={cfg.engine} onChange={e => set('engine', e.target.value)}
             options={[['camoufox','Camoufox (Firefox 防指纹，推荐)'],['playwright','Playwright (Chromium)']]} />
         </Field>
-        <Field label="无头模式" hint="true = 后台无界面批量运行">
-          <Toggle checked={!!cfg.headless} onChange={v => set('headless', v)} />
-        </Field>
-        <Field label="手机模式" hint="使用手机端指纹">
-          <Toggle checked={!!cfg.mobile} onChange={v => set('mobile', v)} />
-        </Field>
-        <Field label="慢速延迟 (ms)" hint="操作间延迟，0 = 自动">
-          <Input type="number" min={0} max={5000} value={cfg.slow_mo ?? 0}
-            onChange={e => set('slow_mo', +e.target.value)} />
+        <Field label="无头模式"><Toggle checked={!!cfg.headless} onChange={v => set('headless', v)} /></Field>
+        <Field label="手机模式"><Toggle checked={!!cfg.mobile} onChange={v => set('mobile', v)} /></Field>
+        <Field label="慢速延迟 (ms)" hint="0 = 自动">
+          <Input type="number" min={0} max={5000} value={cfg.slow_mo ?? 0} onChange={e => set('slow_mo', +e.target.value)} />
         </Field>
       </Section>
-
       <Section title="并发 & 邮件">
-        <Field label="最大并发数" hint="同时运行的浏览器数量">
-          <Input type="number" min={1} max={20} value={cfg.max_concurrent ?? 2}
-            onChange={e => set('max_concurrent', +e.target.value)} />
+        <Field label="最大并发数">
+          <Input type="number" min={1} max={20} value={cfg.max_concurrent ?? 2} onChange={e => set('max_concurrent', +e.target.value)} />
         </Field>
         <Field label="默认邮件服务商">
           <Select value={cfg.mail_provider ?? 'imap:0'} onChange={e => set('mail_provider', e.target.value)}
             options={[
               ['imap:0','IMAP 账户 1'],['imap:1','IMAP 账户 2'],['imap:2','IMAP 账户 3'],
+              ['outlook:0','Outlook 账户 1'],['outlook:1','Outlook 账户 2'],
               ['gptmail','GptMail'],['npcmail','NpcMail'],['yydsmail','YYDSMail'],
             ]} />
         </Field>
       </Section>
-
       <Section title="代理配置">
         <Field label="代理策略">
           <Select value={cfg.proxy_strategy ?? 'none'} onChange={e => set('proxy_strategy', e.target.value)}
             options={[['none','不使用代理'],['static','固定代理'],['pool','代理池']]} />
         </Field>
         {cfg.proxy_strategy === 'static' && (
-          <Field label="固定代理地址" hint="例: http://127.0.0.1:7890">
-            <Input value={cfg.proxy_static ?? ''} onChange={e => set('proxy_static', e.target.value)}
-              placeholder="http://host:port" />
+          <Field label="固定代理地址" hint="http://host:port">
+            <Input value={cfg.proxy_static ?? ''} onChange={e => set('proxy_static', e.target.value)} placeholder="http://127.0.0.1:7890" />
           </Field>
         )}
       </Section>
-
       <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </div>
   )
 }
 
-// ── Tab: Mail providers (DB-backed) ───────────────────────────────────────
+// ── Tab: Mail API providers ───────────────────────────────────────────────
 
 function MailProviderSection({ name, label }) {
   const [data, setData] = useState({ api_key: '', base_url: '' })
   const { saving, saved, error, run } = useSave()
-
-  useEffect(() => {
-    api.getSection(`mail.${name}`).then(setData).catch(() => {})
-  }, [name])
-
+  useEffect(() => { api.getSection(`mail.${name}`).then(setData).catch(() => {}) }, [name])
   const save = () => run(() => api.saveSection(`mail.${name}`, data))
-
   return (
     <Section title={label}>
       <Field label="API Key">
-        <Input type="password" value={data.api_key}
-          onChange={e => setData(d => ({ ...d, api_key: e.target.value }))}
-          placeholder="sk-..." />
+        <Input type="password" value={data.api_key} onChange={e => setData(d => ({ ...d, api_key: e.target.value }))} placeholder="sk-..." />
       </Field>
       <Field label="Base URL">
-        <Input value={data.base_url}
-          onChange={e => setData(d => ({ ...d, base_url: e.target.value }))} />
+        <Input value={data.base_url} onChange={e => setData(d => ({ ...d, base_url: e.target.value }))} />
       </Field>
       <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </Section>
@@ -205,111 +279,641 @@ function MailProviderSection({ name, label }) {
 function TabMail() {
   return (
     <div className="space-y-4">
-      <MailProviderSection name="gptmail" label="GptMail" />
-      <MailProviderSection name="npcmail" label="NpcMail" />
+      <MailProviderSection name="gptmail"  label="GptMail" />
+      <MailProviderSection name="npcmail"  label="NpcMail" />
       <MailProviderSection name="yydsmail" label="YYDSMail" />
     </div>
   )
 }
 
-// ── Tab: IMAP accounts (DB-backed) ────────────────────────────────────────
+// ── Tab: IMAP accounts (provider+accounts structure) ──────────────────────
 
-const EMPTY_IMAP = { email: '', password: '', host: '', port: 993, ssl: true, folder: 'INBOX' }
+const EMPTY_IMAP_PROVIDER = {
+  name: '新 IMAP 服务商',
+  host: '',
+  port: 993,
+  ssl: true,
+  folder: 'INBOX',
+  auth_type: 'password',
+  use_alias: null,
+  accounts: [],
+}
 
-function TabImap() {
-  const [accounts, setAccounts] = useState([])
-  const { saving, saved, error, run } = useSave()
+const EMPTY_IMAP_ACCOUNT = { email: '', credential: '' }
 
-  useEffect(() => {
-    api.getSection('mail.imap').then(d => setAccounts(Array.isArray(d) ? d : [])).catch(() => {})
-  }, [])
+const IMAP_ACCOUNT_IMPORT_HINT = `# 每行一个账户，格式: 邮箱<空格或TAB>密码/授权码
+# 也支持四短线分隔：
+user@qq.com  授权码1
+user2@qq.com授权码2
+user3@163.com----授权码3`.trim()
 
-  const update = (i, k, v) => setAccounts(a => a.map((acc, idx) => idx === i ? { ...acc, [k]: v } : acc))
-  const add    = () => setAccounts(a => [...a, { ...EMPTY_IMAP }])
-  const remove = (i) => setAccounts(a => a.filter((_, idx) => idx !== i))
-  const save   = () => run(() => api.saveSection('mail.imap', accounts))
+function ImapAccountImportModal({ onImport, onClose }) {
+  const [text, setText] = useState('')
+  const [parsed, setParsed] = useState([])
+  const [err, setErr] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const parse = async () => {
+    setErr('')
+    try {
+      const r = await api.parseImapAccountsNew(text)
+      setParsed(r.parsed)
+    } catch (e) {
+      setErr(e.message)
+      setParsed([])
+    }
+  }
+
+  const confirm = async () => {
+    setSaving(true)
+    try { onImport(parsed); onClose() }
+    catch (e) { setErr(e.message) }
+    finally { setSaving(false) }
+  }
 
   return (
-    <div className="space-y-4">
-      {accounts.map((acc, i) => (
-        <div key={i} className="border border-gray-100 rounded-xl overflow-hidden">
-          <div className="bg-gray-50 px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-            <h4 className="text-sm font-semibold text-gray-700">IMAP 账户 {i + 1}</h4>
-            <button onClick={() => remove(i)}
-              className="text-xs text-red-400 hover:text-red-600 transition-colors">删除</button>
-          </div>
-          <div className="p-5 space-y-0">
-            <Field label="邮箱地址">
-              <Input value={acc.email} onChange={e => update(i, 'email', e.target.value)}
-                placeholder="user@qq.com" />
-            </Field>
-            <Field label="密码 / 授权码">
-              <Input type="password" value={acc.password} onChange={e => update(i, 'password', e.target.value)} />
-            </Field>
-            <Field label="IMAP 服务器">
-              <Input value={acc.host} onChange={e => update(i, 'host', e.target.value)}
-                placeholder="imap.qq.com" />
-            </Field>
-            <Field label="端口">
-              <Input type="number" value={acc.port} onChange={e => update(i, 'port', +e.target.value)} />
-            </Field>
-            <Field label="SSL/TLS" hint="993=IMAPS(推荐), 143=STARTTLS">
-              <Toggle checked={!!acc.ssl} onChange={v => update(i, 'ssl', v)} />
-            </Field>
-            <Field label="收件箱文件夹">
-              <Input value={acc.folder} onChange={e => update(i, 'folder', e.target.value)} />
-            </Field>
-          </div>
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg flex flex-col max-h-[80vh]">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">批量导入账户</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
         </div>
-      ))}
-
-      <button onClick={add}
-        className="w-full border-2 border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-xl py-3 text-sm transition-colors">
-        + 添加 IMAP 账户
-      </button>
-
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
+        <div className="p-6 flex-1 overflow-y-auto space-y-3">
+          <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 font-mono whitespace-pre-wrap leading-relaxed">
+            {IMAP_ACCOUNT_IMPORT_HINT}
+          </div>
+          <textarea
+            value={text} onChange={e => setText(e.target.value)}
+            placeholder="粘贴账户列表..."
+            rows={6}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+          <button onClick={parse} disabled={!text.trim()}
+            className="bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 text-sm font-medium px-4 py-2 rounded-lg transition-colors">
+            解析预览
+          </button>
+          {err && <p className="text-xs text-red-500">{err}</p>}
+          {parsed.length > 0 && (
+            <p className="text-sm text-gray-700">
+              解析成功 <span className="text-blue-600 font-bold">{parsed.length}</span> 个账户
+            </p>
+          )}
+        </div>
+        <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">取消</button>
+          <button onClick={confirm} disabled={!parsed.length || saving}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors">
+            {saving && <Spinner />}
+            {saving ? '添加中…' : `添加 ${parsed.length} 个账户`}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
 
-// ── Tab: Timeouts (DB-backed) ─────────────────────────────────────────────
+function TabImap() {
+  const [providers, setProviders] = useState([])
+  const [importForIdx, setImportForIdx] = useState(null)  // which provider to import into
+  const [collapsed, setCollapsed] = useState({})
+  const { saving, saved, error, run } = useSave()
+
+  const load = useCallback(() => {
+    api.getSection('mail.imap').then(d => {
+      const raw = Array.isArray(d) ? d : []
+      // Auto-migrate old flat format to new provider+accounts format
+      if (raw.length > 0 && !('accounts' in raw[0])) {
+        // Old format: each item is an account, wrap into one default provider
+        setProviders([{
+          ...EMPTY_IMAP_PROVIDER,
+          name: '默认 IMAP 服务商',
+          accounts: raw.map(a => ({
+            email: a.email || '',
+            credential: a.password || a.access_token || '',
+          })),
+        }])
+      } else {
+        setProviders(raw)
+      }
+    }).catch(() => {})
+  }, [])
+  useEffect(() => { load() }, [load])
+
+  const save = () => run(() => api.saveSection('mail.imap', providers))
+
+  // Provider-level helpers
+  const addProvider    = () => setProviders(p => [...p, { ...EMPTY_IMAP_PROVIDER, accounts: [] }])
+  const removeProvider = (pi) => setProviders(p => p.filter((_, i) => i !== pi))
+  const updateProvider = (pi, k, v) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, [k]: v } : prov))
+  const toggleCollapse = (pi) => setCollapsed(c => ({ ...c, [pi]: !c[pi] }))
+
+  // Account-level helpers
+  const addAccount    = (pi) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: [...prov.accounts, { ...EMPTY_IMAP_ACCOUNT }] } : prov))
+  const removeAccount = (pi, ai) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: prov.accounts.filter((_, j) => j !== ai) } : prov))
+  const updateAccount = (pi, ai, k, v) => setProviders(p => p.map((prov, i) =>
+    i === pi ? { ...prov, accounts: prov.accounts.map((acc, j) => j === ai ? { ...acc, [k]: v } : acc) } : prov
+  ))
+
+  const handleImportAccounts = (pi, parsed) => {
+    setProviders(p => p.map((prov, i) => {
+      if (i !== pi) return prov
+      const existingEmails = new Set(prov.accounts.map(a => a.email.toLowerCase()))
+      const newAccounts = parsed.filter(a => !existingEmails.has(a.email.toLowerCase()))
+      return { ...prov, accounts: [...prov.accounts, ...newAccounts] }
+    }))
+  }
+
+  const totalAccounts = providers.reduce((sum, p) => sum + (p.accounts?.length || 0), 0)
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-gray-600">
+          共 <span className="font-semibold text-blue-600">{providers.length}</span> 个服务商，
+          <span className="font-semibold text-blue-600 ml-1">{totalAccounts}</span> 个账户
+        </p>
+      </div>
+
+      {providers.map((prov, pi) => {
+        const isCollapsed = collapsed[pi]
+        const accCount = prov.accounts?.length || 0
+        return (
+          <div key={pi} className="border border-gray-200 rounded-xl overflow-hidden">
+            {/* Provider header */}
+            <div className="bg-gray-50 px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+              <div className="flex items-center gap-2 flex-1 min-w-0">
+                <button onClick={() => toggleCollapse(pi)} className="text-gray-400 hover:text-gray-600 text-sm">
+                  {isCollapsed ? '▶' : '▼'}
+                </button>
+                <input
+                  value={prov.name || ''}
+                  onChange={e => updateProvider(pi, 'name', e.target.value)}
+                  className="text-sm font-semibold text-gray-700 bg-transparent border-0 outline-none focus:bg-white focus:border focus:border-gray-200 focus:rounded px-1 min-w-0 flex-1"
+                  placeholder="服务商名称"
+                />
+                <span className="text-xs text-gray-400 whitespace-nowrap">{accCount} 账户</span>
+              </div>
+              <button onClick={() => removeProvider(pi)} className="text-xs text-red-400 hover:text-red-600 ml-3">删除服务商</button>
+            </div>
+
+            {!isCollapsed && (
+              <div className="p-5 space-y-4">
+                {/* Shared config */}
+                <div className="space-y-0">
+                  <Field label="IMAP 服务器" hint="留空则按账户域名自动检测">
+                    <Input value={prov.host || ''} onChange={e => updateProvider(pi, 'host', e.target.value)} placeholder="imap.qq.com（可留空）" />
+                  </Field>
+                  <Field label="端口">
+                    <Input type="number" value={prov.port || 993} onChange={e => updateProvider(pi, 'port', +e.target.value)} />
+                  </Field>
+                  <Field label="SSL/TLS"><Toggle checked={!!prov.ssl} onChange={v => updateProvider(pi, 'ssl', v)} /></Field>
+                  <Field label="收件箱文件夹">
+                    <Input value={prov.folder || 'INBOX'} onChange={e => updateProvider(pi, 'folder', e.target.value)} />
+                  </Field>
+                  <Field label="认证方式">
+                    <Select value={prov.auth_type || 'password'} onChange={e => updateProvider(pi, 'auth_type', e.target.value)}
+                      options={[['password','密码/授权码'],['oauth2','OAuth2 (XOAUTH2)']]} />
+                  </Field>
+                  <Field label="别名模式" hint="null=自动 (qq/gmail 自动启用 +alias)">
+                    <Select
+                      value={prov.use_alias === null || prov.use_alias === undefined ? 'auto' : prov.use_alias ? 'true' : 'false'}
+                      onChange={e => updateProvider(pi, 'use_alias', e.target.value === 'auto' ? null : e.target.value === 'true')}
+                      options={[['auto','自动 (qq/gmail 启用)'],['true','始终启用'],['false','始终禁用']]}
+                    />
+                  </Field>
+                </div>
+
+                {/* Accounts sub-list */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">账户列表 ({accCount})</p>
+                    <button onClick={() => setImportForIdx(pi)}
+                      className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-600 px-2.5 py-1 rounded transition-colors">
+                      📥 批量导入
+                    </button>
+                  </div>
+
+                  {(prov.accounts || []).map((acc, ai) => (
+                    <div key={ai} className="flex items-center gap-2 py-1.5 border-b border-gray-50 last:border-0">
+                      <input
+                        value={acc.email || ''}
+                        onChange={e => updateAccount(pi, ai, 'email', e.target.value)}
+                        placeholder="邮箱地址"
+                        className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      />
+                      <input
+                        type="password"
+                        value={acc.credential || ''}
+                        onChange={e => updateAccount(pi, ai, 'credential', e.target.value)}
+                        placeholder={prov.auth_type === 'oauth2' ? 'Access Token' : '密码/授权码'}
+                        className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                      />
+                      <button onClick={() => removeAccount(pi, ai)} className="text-gray-300 hover:text-red-500 text-sm flex-shrink-0">×</button>
+                    </div>
+                  ))}
+
+                  <button onClick={() => addAccount(pi)}
+                    className="mt-2 w-full border border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-lg py-1.5 text-xs transition-colors">
+                    + 添加账户
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      <button onClick={addProvider}
+        className="w-full border-2 border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-xl py-3 text-sm transition-colors">
+        + 添加 IMAP 服务商
+      </button>
+      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
+
+      {importForIdx !== null && (
+        <ImapAccountImportModal
+          onImport={(parsed) => handleImportAccounts(importForIdx, parsed)}
+          onClose={() => setImportForIdx(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ── Tab: Outlook / Hotmail ────────────────────────────────────────────────
+
+const EMPTY_OUTLOOK = {
+  email: '', password: '', client_id: '', tenant_id: 'consumers',
+  refresh_token: '', access_token: '', fetch_method: 'graph',
+}
+
+const OUTLOOK_IMPORT_HINT = `# 四短线分隔（推荐，每行一条）：
+邮箱----密码----Client Id----刷新令牌
+user@outlook.com----MyPass----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AXxx...
+
+# JSON 数组格式：
+[{"email":"user@outlook.com","client_id":"xxx","refresh_token":"0.AXxx..."}]
+
+# 竖线分隔（每行一条）：
+email|client_id|tenant_id|refresh_token[|fetch_method]`.trim()
+
+// ── Outlook 账户编辑拟态框 ─────────────────────────────────────────────────
+
+function OutlookEditModal({ account, onSave, onClose }) {
+  const [acc, setAcc] = useState({ ...account })
+  const set = (k, v) => setAcc(a => ({ ...a, [k]: v }))
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg flex flex-col max-h-[90vh]">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <div>
+            <h3 className="font-semibold text-gray-800">Outlook 账户详情 / 编辑</h3>
+            {acc.email && <p className="text-xs text-gray-400 mt-0.5">{acc.email}</p>}
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+        </div>
+        <div className="p-6 flex-1 overflow-y-auto">
+          <Field label="邮箱地址">
+            <Input value={acc.email || ''} onChange={e => set('email', e.target.value)} placeholder="user@outlook.com" />
+          </Field>
+          <Field label="密码" hint="仅存储备用，OAuth 不使用">
+            <Input type="password" value={acc.password || ''} onChange={e => set('password', e.target.value)} placeholder="（可选）" />
+          </Field>
+          <Field label="取件方式" hint="Graph API 推荐，无需 IMAP 权限">
+            <Select value={acc.fetch_method || 'graph'} onChange={e => set('fetch_method', e.target.value)}
+              options={[['graph','Microsoft Graph API（推荐）'],['imap','IMAP + XOAUTH2']]} />
+          </Field>
+          <Field label="Client ID" hint="Azure AD 应用程序 (客户端) ID">
+            <Input value={acc.client_id || ''} onChange={e => set('client_id', e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+          </Field>
+          <Field label="Tenant ID" hint="个人账户: consumers | 企业: 租户 GUID 或 common">
+            <Input value={acc.tenant_id || 'consumers'} onChange={e => set('tenant_id', e.target.value)} placeholder="consumers" />
+          </Field>
+          <Field label="Refresh Token" hint="长期有效，用于自动刷新 access_token">
+            <Input type="password" value={acc.refresh_token || ''} onChange={e => set('refresh_token', e.target.value)} placeholder="0.AXxx..." />
+          </Field>
+          <Field label="Access Token" hint="可留空，系统自动获取">
+            <Input type="password" value={acc.access_token || ''} onChange={e => set('access_token', e.target.value)} placeholder="（留空自动获取）" />
+          </Field>
+        </div>
+        <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">取消</button>
+          <button
+            onClick={() => { onSave(acc); onClose() }}
+            className="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors"
+          >
+            保存修改
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Outlook 批量导入拟态框（含取件方式选择）──────────────────────────────────
+
+function OutlookImportModal({ onImport, onClose }) {
+  const [text, setText] = useState('')
+  const [fetchMethod, setFetchMethod] = useState('graph')
+  const [parsed, setParsed] = useState([])
+  const [err, setErr] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const parse = async () => {
+    setErr('')
+    try {
+      const r = await api.parseOutlookAccounts(text)
+      // 将选定的 fetch_method 应用到所有解析结果
+      setParsed(r.parsed.map(a => ({ ...a, fetch_method: fetchMethod })))
+    } catch (e) {
+      setErr(e.message || String(e))
+      setParsed([])
+    }
+  }
+
+  // 切换方式时同步更新已解析列表
+  const changeMethod = (method) => {
+    setFetchMethod(method)
+    setParsed(p => p.map(a => ({ ...a, fetch_method: method })))
+  }
+
+  const confirm = async () => {
+    setSaving(true)
+    try { await onImport(parsed); onClose() }
+    catch (e) { setErr(e.message) }
+    finally { setSaving(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl flex flex-col max-h-[90vh]">
+        <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">批量导入 Outlook 账户</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+        </div>
+        <div className="p-6 flex-1 overflow-y-auto space-y-4">
+
+          {/* 取件方式选择 */}
+          <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+            <span className="text-sm text-gray-600 font-medium whitespace-nowrap">取件方式：</span>
+            <div className="flex gap-2">
+              {[['graph','📊 Graph API（推荐）'], ['imap','📬 IMAP + XOAUTH2']].map(([v, l]) => (
+                <button
+                  key={v}
+                  onClick={() => changeMethod(v)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                    fetchMethod === v
+                      ? v === 'graph'
+                        ? 'bg-green-600 text-white border-green-600 shadow-sm'
+                        : 'bg-yellow-500 text-white border-yellow-500 shadow-sm'
+                      : 'bg-white text-gray-600 border-gray-200 hover:border-gray-300'
+                  }`}
+                >
+                  {l}
+                </button>
+              ))}
+            </div>
+            <span className="text-xs text-gray-400">将覆盖所有导入账户的取件方式</span>
+          </div>
+
+          {/* 格式提示 */}
+          <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-xs text-blue-700 whitespace-pre-wrap font-mono leading-relaxed">
+            {OUTLOOK_IMPORT_HINT}
+          </div>
+
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            placeholder="粘贴账户列表..."
+            rows={8}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+          <button
+            onClick={parse}
+            disabled={!text.trim()}
+            className="bg-gray-100 hover:bg-gray-200 disabled:opacity-50 text-gray-700 text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            解析预览
+          </button>
+
+          {err && <p className="text-xs text-red-500">{err}</p>}
+
+          {parsed.length > 0 && (
+            <div>
+              <p className="text-sm font-medium text-gray-700 mb-2">
+                解析成功 <span className="text-blue-600 font-bold">{parsed.length}</span> 条 &nbsp;·&nbsp; 取件方式：
+                <span className={`ml-1 text-xs px-1.5 py-0.5 rounded font-semibold ${fetchMethod === 'graph' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>
+                  {fetchMethod}
+                </span>
+              </p>
+              <div className="border border-gray-100 rounded-lg overflow-auto max-h-48">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-3 py-2 text-left text-gray-500 font-medium">email</th>
+                      <th className="px-3 py-2 text-left text-gray-500 font-medium">client_id</th>
+                      <th className="px-3 py-2 text-left text-gray-500 font-medium">fetch_method</th>
+                      <th className="px-3 py-2 text-left text-gray-500 font-medium">password</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-50">
+                    {parsed.map((row, i) => (
+                      <tr key={i}>
+                        <td className="px-3 py-1.5 text-gray-700 font-mono">{row.email}</td>
+                        <td className="px-3 py-1.5 text-gray-500 font-mono">{row.client_id ? row.client_id.slice(0, 8) + '…' : '—'}</td>
+                        <td className="px-3 py-1.5">
+                          <span className={`text-xs px-1.5 py-0.5 rounded ${row.fetch_method === 'graph' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>
+                            {row.fetch_method}
+                          </span>
+                        </td>
+                        <td className="px-3 py-1.5 text-gray-400">{row.password ? '******' : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-end gap-3">
+          <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">取消</button>
+          <button
+            onClick={confirm}
+            disabled={!parsed.length || saving}
+            className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors"
+          >
+            {saving && <Spinner />}
+            {saving ? '添加中…' : `添加 ${parsed.length} 条`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Tab: Outlook ──────────────────────────────────────────────────────────
+
+function TabOutlook() {
+  const [accounts, setAccounts] = useState([])
+  const [showImport, setShowImport] = useState(false)
+  const [editIdx, setEditIdx] = useState(null)
+  const { saving, saved, error, run } = useSave()
+
+  const load = useCallback(() => {
+    api.getSection('mail.outlook').then(d => setAccounts(Array.isArray(d) ? d : [])).catch(() => {})
+  }, [])
+  useEffect(() => { load() }, [load])
+
+  const add = () => {
+    const idx = accounts.length
+    setAccounts(a => [...a, { ...EMPTY_OUTLOOK }])
+    setEditIdx(idx)
+  }
+  const remove = (i) => {
+    setAccounts(a => a.filter((_, idx) => idx !== i))
+    if (editIdx === i) setEditIdx(null)
+  }
+  const updateAcc = (i, updated) => setAccounts(a => a.map((acc, idx) => idx === i ? updated : acc))
+  const save = () => run(() => api.saveSection('mail.outlook', accounts))
+  const handleImport = async (parsed) => { await api.saveOutlookAccounts(parsed); load() }
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800 space-y-1">
+        <p className="font-semibold">📋 Outlook / Hotmail OAuth2 说明</p>
+        <p>· 需在 Azure AD 注册应用并获取 client_id 和 refresh_token（设备码授权流程一次性获取）</p>
+        <p>· <strong>Graph API（推荐）</strong>：权限 <code className="bg-blue-100 px-1 rounded">Mail.Read, offline_access</code></p>
+        <p>· <strong>IMAP 方式</strong>：权限 <code className="bg-blue-100 px-1 rounded">IMAP.AccessAsUser.All, offline_access</code></p>
+        <p>· tenant_id：个人账户填 <code className="bg-blue-100 px-1 rounded">consumers</code>，企业账户填租户 GUID 或 <code className="bg-blue-100 px-1 rounded">common</code></p>
+        <p>· access_token 由系统自动刷新，无需手动填写</p>
+      </div>
+
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-gray-600">
+          共 <span className="font-semibold text-blue-600">{accounts.length}</span> 个 Outlook 账户
+        </p>
+        <button onClick={() => setShowImport(true)}
+          className="text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg transition-colors">
+          📥 批量导入
+        </button>
+      </div>
+
+      {/* 账户卡片列表 */}
+      <div className="space-y-2">
+        {accounts.length === 0 && (
+          <p className="text-center text-sm text-gray-400 py-6">暂无账户，点击下方按钮添加</p>
+        )}
+        {accounts.map((acc, i) => (
+          <div key={i}
+            className="border border-gray-100 rounded-xl px-4 py-3 flex items-center gap-3 hover:border-gray-200 bg-white transition-colors"
+          >
+            {/* 图标 */}
+            <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center flex-shrink-0 text-sm">
+              🔵
+            </div>
+            {/* 信息 */}
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm font-medium text-gray-800 truncate">
+                  {acc.email || <span className="text-gray-400 font-normal">未设置邮箱</span>}
+                </span>
+                <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${
+                  (acc.fetch_method || 'graph') === 'graph'
+                    ? 'bg-green-100 text-green-700'
+                    : 'bg-yellow-100 text-yellow-700'
+                }`}>
+                  {acc.fetch_method || 'graph'}
+                </span>
+              </div>
+              <p className="text-xs text-gray-400 mt-0.5 truncate">
+                {acc.client_id
+                  ? <span className="font-mono">client: {acc.client_id.slice(0, 8)}…</span>
+                  : <span className="text-orange-400">⚠ 未设置 Client ID</span>
+                }
+                {acc.refresh_token
+                  ? <span className="ml-2 text-green-600">✓ Refresh Token</span>
+                  : <span className="ml-2 text-orange-400">⚠ 未设置 Refresh Token</span>
+                }
+                {acc.password && <span className="ml-2">· 已设置密码</span>}
+              </p>
+            </div>
+            {/* 操作 */}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <button
+                onClick={() => setEditIdx(i)}
+                className="text-xs text-blue-500 hover:text-blue-700 px-2.5 py-1 rounded border border-blue-100 hover:border-blue-300 transition-colors"
+              >
+                详情 / 编辑
+              </button>
+              <button
+                onClick={() => remove(i)}
+                className="text-xs text-red-400 hover:text-red-600 px-2 py-1"
+              >
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <button onClick={add}
+        className="w-full border-2 border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-xl py-3 text-sm transition-colors">
+        + 手动添加 Outlook 账户
+      </button>
+      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
+
+      {/* 批量导入拟态框 */}
+      {showImport && (
+        <OutlookImportModal
+          onImport={handleImport}
+          onClose={() => { setShowImport(false); load() }}
+        />
+      )}
+
+      {/* 账户编辑拟态框 */}
+      {editIdx !== null && accounts[editIdx] && (
+        <OutlookEditModal
+          account={accounts[editIdx]}
+          onSave={(updated) => updateAcc(editIdx, updated)}
+          onClose={() => setEditIdx(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ── Tab: Timeouts ─────────────────────────────────────────────────────────
 
 const TIMEOUT_LABELS = {
-  page_load:            ['页面加载', 'page.goto() 超时'],
-  auth0_redirect:       ['Auth0 重定向', '等待跳转到 auth.openai.com'],
-  email_input:          ['邮箱输入框', '等待邮箱输入框出现'],
-  password_input:       ['密码输入框', '等待密码输入框出现'],
-  otp_input:            ['OTP 输入框', '等待 OTP 输入框出现'],
-  otp_code:             ['OTP 验证码', '轮询邮箱获取验证码'],
-  profile_detect:       ['姓名页检测', '等待姓名输入框出现'],
-  profile_field:        ['姓名字段', '等待每个字段'],
-  complete_redirect:    ['注册完成跳转', '等待跳回 chatgpt.com'],
-  oauth_navigate:       ['OAuth 导航', 'page.goto() to /oauth/authorize'],
-  oauth_flow_element:   ['OAuth 元素', '等待授权按钮出现'],
-  oauth_login_email:    ['OAuth 邮箱', '等待 OAuth 重新登录邮箱框'],
-  oauth_login_password: ['OAuth 密码', '等待 OAuth 重新登录密码框'],
-  oauth_token_exchange: ['Token 交换', 'httpx /oauth/token 超时'],
-  oauth_total:          ['OAuth 总超时', 'OAuth 流程硬超时'],
+  page_load:            ['页面加载',       'page.goto() 超时'],
+  auth0_redirect:       ['Auth0 重定向',   '等待跳转到 auth.openai.com'],
+  email_input:          ['邮箱输入框',     '等待邮箱输入框出现'],
+  password_input:       ['密码输入框',     '等待密码输入框出现'],
+  otp_input:            ['OTP 输入框',     '等待 OTP 输入框出现'],
+  otp_code:             ['OTP 验证码',     '轮询邮箱获取验证码'],
+  profile_detect:       ['姓名页检测',     '等待姓名输入框出现'],
+  profile_field:        ['姓名字段',       '等待每个字段'],
+  complete_redirect:    ['注册完成跳转',   '等待跳回 chatgpt.com'],
+  oauth_navigate:       ['OAuth 导航',     'page.goto() to /oauth/authorize'],
+  oauth_flow_element:   ['OAuth 元素',     '等待授权按钮出现'],
+  oauth_login_email:    ['OAuth 邮箱',     '等待 OAuth 重新登录邮箱框'],
+  oauth_login_password: ['OAuth 密码',     '等待 OAuth 重新登录密码框'],
+  oauth_token_exchange: ['Token 交换',     'httpx /oauth/token 超时'],
+  oauth_total:          ['OAuth 总超时',   'OAuth 流程硬超时'],
 }
 
 function TabTimeouts() {
   const [data, setData] = useState({})
   const { saving, saved, error, run } = useSave()
-
   useEffect(() => { api.getSection('timeouts').then(setData).catch(() => {}) }, [])
-
-  const set = (k, v) => setData(d => ({ ...d, [k]: v }))
+  const set  = (k, v) => setData(d => ({ ...d, [k]: v }))
   const save = () => run(() => api.saveSection('timeouts', data))
-
   return (
     <div className="space-y-4">
       <Section title="超时配置（单位：秒）">
         {Object.entries(TIMEOUT_LABELS).map(([k, [label, hint]]) => (
           <Field key={k} label={label} hint={hint}>
-            <Input type="number" min={1} max={600}
-              value={data[k] ?? ''}
-              onChange={e => set(k, +e.target.value)} />
+            <Input type="number" min={1} max={600} value={data[k] ?? ''} onChange={e => set(k, +e.target.value)} />
           </Field>
         ))}
       </Section>
@@ -318,16 +922,15 @@ function TabTimeouts() {
   )
 }
 
-// ── Tab: Advanced (DB-backed) ─────────────────────────────────────────────
+// ── Tab: Advanced ─────────────────────────────────────────────────────────
 
 function TabAdvanced() {
-  const [mouse,   setMouse]   = useState({})
-  const [timing,  setTiming]  = useState({})
-  const [oauth,   setOauth]   = useState({ enabled: true, timeout: 45 })
-  const [reg,     setReg]     = useState({ prefix: '', domain: '' })
-  const [team,    setTeam]    = useState({ url: '', key: '' })
-  const [sync,    setSync]    = useState({ url: '', key: '' })
-
+  const [mouse,  setMouse]  = useState({})
+  const [timing, setTiming] = useState({})
+  const [oauth,  setOauth]  = useState({ enabled: true, timeout: 45 })
+  const [reg,    setReg]    = useState({ prefix: '', domain: '' })
+  const [team,   setTeam]   = useState({ url: '', key: '' })
+  const [sync,   setSync]   = useState({ url: '', key: '' })
   const { saving, saved, error, run } = useSave()
 
   useEffect(() => {
@@ -352,77 +955,49 @@ function TabAdvanced() {
     ])
   })
 
-  const mf = (k, v) => setMouse(d => ({ ...d, [k]: v }))
-  const tf = (k, v) => setTiming(d => ({ ...d, [k]: v }))
-
   return (
     <div className="space-y-4">
       <Section title="鼠标模拟配置">
         {[
-          ['steps_min',       '最少弧线步数', ''],
-          ['steps_max',       '最多弧线步数', ''],
-          ['step_delay_min',  '每步最短延迟 (秒)', ''],
-          ['step_delay_max',  '每步最长延迟 (秒)', ''],
-          ['hover_min',       '悬停最短时间 (秒)', ''],
-          ['hover_max',       '悬停最长时间 (秒)', ''],
-        ].map(([k, label, hint]) => (
-          <Field key={k} label={label} hint={hint}>
-            <Input type="number" step="0.001" min={0} value={mouse[k] ?? ''}
-              onChange={e => mf(k, +e.target.value)} />
+          ['steps_min','最少弧线步数'],['steps_max','最多弧线步数'],
+          ['step_delay_min','每步最短延迟 (秒)'],['step_delay_max','每步最长延迟 (秒)'],
+          ['hover_min','悬停最短时间 (秒)'],['hover_max','悬停最长时间 (秒)'],
+        ].map(([k, label]) => (
+          <Field key={k} label={label}>
+            <Input type="number" step="0.001" min={0} value={mouse[k] ?? ''} onChange={e => setMouse(d => ({ ...d, [k]: +e.target.value }))} />
           </Field>
         ))}
       </Section>
-
       <Section title="等待时间配置 (秒)">
         {[
-          ['post_nav',      '导航后等待',   '跳转/重定向后等待时间'],
-          ['pre_fill',      '填写前等待',   '填写/点击前等待时间'],
-          ['post_click',    '点击后等待',   '点击提交按钮后等待时间'],
-          ['post_complete', '完成后等待',   'COMPLETE 状态结束前等待'],
+          ['post_nav','导航后等待','跳转/重定向后'],
+          ['pre_fill','填写前等待','填写/点击前'],
+          ['post_click','点击后等待','提交按钮后'],
+          ['post_complete','完成后等待','COMPLETE 状态结束前'],
         ].map(([k, label, hint]) => (
           <Field key={k} label={label} hint={hint}>
-            <Input type="number" step="0.1" min={0} value={timing[k] ?? ''}
-              onChange={e => tf(k, +e.target.value)} />
+            <Input type="number" step="0.1" min={0} value={timing[k] ?? ''} onChange={e => setTiming(d => ({ ...d, [k]: +e.target.value }))} />
           </Field>
         ))}
       </Section>
-
       <Section title="OAuth 配置">
         <Field label="自动获取 Token" hint="注册完成后自动完成 OAuth 授权">
           <Toggle checked={!!oauth.enabled} onChange={v => setOauth(d => ({ ...d, enabled: v }))} />
         </Field>
         <Field label="OAuth 超时 (秒)">
-          <Input type="number" min={10} max={300} value={oauth.timeout ?? 45}
-            onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
+          <Input type="number" min={10} max={300} value={oauth.timeout ?? 45} onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
         </Field>
       </Section>
-
       <Section title="注册配置">
-        <Field label="邮箱前缀" hint="生成邮箱地址时的前缀">
-          <Input value={reg.prefix ?? ''} onChange={e => setReg(d => ({ ...d, prefix: e.target.value }))} />
-        </Field>
-        <Field label="邮箱域名" hint="留空则使用邮件服务商默认域名">
-          <Input value={reg.domain ?? ''} onChange={e => setReg(d => ({ ...d, domain: e.target.value }))} />
-        </Field>
+        <Field label="邮箱前缀"><Input value={reg.prefix ?? ''} onChange={e => setReg(d => ({ ...d, prefix: e.target.value }))} /></Field>
+        <Field label="邮箱域名"><Input value={reg.domain ?? ''} onChange={e => setReg(d => ({ ...d, domain: e.target.value }))} /></Field>
       </Section>
-
       <Section title="团队 & 同步">
-        <Field label="Team URL">
-          <Input value={team.url ?? ''} onChange={e => setTeam(d => ({ ...d, url: e.target.value }))}
-            placeholder="https://..." />
-        </Field>
-        <Field label="Team Key">
-          <Input type="password" value={team.key ?? ''} onChange={e => setTeam(d => ({ ...d, key: e.target.value }))} />
-        </Field>
-        <Field label="Sync URL">
-          <Input value={sync.url ?? ''} onChange={e => setSync(d => ({ ...d, url: e.target.value }))}
-            placeholder="https://..." />
-        </Field>
-        <Field label="Sync Key">
-          <Input type="password" value={sync.key ?? ''} onChange={e => setSync(d => ({ ...d, key: e.target.value }))} />
-        </Field>
+        <Field label="Team URL"><Input value={team.url ?? ''} onChange={e => setTeam(d => ({ ...d, url: e.target.value }))} placeholder="https://..." /></Field>
+        <Field label="Team Key"><Input type="password" value={team.key ?? ''} onChange={e => setTeam(d => ({ ...d, key: e.target.value }))} /></Field>
+        <Field label="Sync URL"><Input value={sync.url ?? ''} onChange={e => setSync(d => ({ ...d, url: e.target.value }))} placeholder="https://..." /></Field>
+        <Field label="Sync Key"><Input type="password" value={sync.key ?? ''} onChange={e => setSync(d => ({ ...d, key: e.target.value }))} /></Field>
       </Section>
-
       <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </div>
   )
@@ -434,46 +1009,37 @@ const TABS = [
   { key: 'general',   label: '⚙️ 通用配置' },
   { key: 'mail',      label: '📧 邮件服务' },
   { key: 'imap',      label: '📥 IMAP 账户' },
+  { key: 'outlook',   label: '🔵 Outlook' },
   { key: 'timeouts',  label: '⏱ 超时设置' },
   { key: 'advanced',  label: '🔧 高级设置' },
 ]
 
 export function Settings() {
   const [tab, setTab] = useState('general')
-
   return (
     <div className="p-6 space-y-5">
       <div>
         <h2 className="text-xl font-bold text-gray-800">配置管理</h2>
         <p className="text-sm text-gray-500 mt-0.5">通用配置保存至 config.yaml，其余设置存入数据库</p>
       </div>
-
-      {/* Tab bar */}
-      <div className="flex gap-1 border-b border-gray-200">
+      <div className="flex gap-1 border-b border-gray-200 flex-wrap">
         {TABS.map(t => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
+          <button key={t.key} onClick={() => setTab(t.key)}
             className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${
-              tab === t.key
-                ? 'border-blue-600 text-blue-600'
-                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            }`}
-          >
+              tab === t.key ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+            }`}>
             {t.label}
           </button>
         ))}
       </div>
-
-      {/* Tab content */}
       <div>
         {tab === 'general'  && <TabGeneral />}
         {tab === 'mail'     && <TabMail />}
         {tab === 'imap'     && <TabImap />}
+        {tab === 'outlook'  && <TabOutlook />}
         {tab === 'timeouts' && <TabTimeouts />}
         {tab === 'advanced' && <TabAdvanced />}
       </div>
     </div>
   )
 }
-

@@ -9,6 +9,52 @@ function elapsed(started) {
   return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
+/** Build the provider <option> list dynamically from configured accounts */
+function useProviderOptions() {
+  const [opts, setOpts] = useState([
+    ['imap:0', 'IMAP 服务商 1'],
+    ['gptmail', 'GptMail'],
+  ])
+
+  useEffect(() => {
+    api.getSettings().then(s => {
+      const items = []
+      const imapProviders = Array.isArray(s['mail.imap']) ? s['mail.imap'] : []
+
+      // Detect new provider+accounts format vs old flat format
+      const isNewFormat = imapProviders.length > 0 && 'accounts' in imapProviders[0]
+
+      if (isNewFormat) {
+        imapProviders.forEach((prov, i) => {
+          const name  = prov.name || `IMAP 服务商 ${i + 1}`
+          const count = Array.isArray(prov.accounts) ? prov.accounts.length : 0
+          items.push([`imap:${i}`, `${name} (${count} 账户)`])
+        })
+      } else {
+        // Old flat format — show individual accounts
+        imapProviders.forEach((acc, i) => {
+          items.push([`imap:${i}`, acc.email ? `IMAP: ${acc.email}` : `IMAP 账户 ${i + 1}`])
+        })
+      }
+      if (items.filter(([v]) => v.startsWith('imap')).length === 0) {
+        items.push(['imap:0', 'IMAP 服务商 1'])
+      }
+
+      // Outlook
+      const outlookAccounts = Array.isArray(s['mail.outlook']) ? s['mail.outlook'] : []
+      if (outlookAccounts.length > 0) {
+        items.push(['outlook', `Outlook (${outlookAccounts.length} 账户)`])
+      }
+
+      // API providers
+      items.push(['gptmail', 'GptMail'], ['npcmail', 'NpcMail'], ['yydsmail', 'YYDSMail'])
+      setOpts(items)
+    }).catch(() => {})
+  }, [])
+
+  return opts
+}
+
 export function Jobs() {
   const [jobs, setJobs]               = useState([])
   const [selected, setSelected]       = useState(null)
@@ -17,6 +63,7 @@ export function Jobs() {
   const [starting, setStarting]       = useState(false)
   const [startErr, setStartErr]       = useState('')
   const logRef                        = useRef(null)
+  const providerOpts                  = useProviderOptions()
 
   // Poll jobs list
   useEffect(() => {
@@ -51,6 +98,12 @@ export function Jobs() {
     } finally {
       setStarting(false)
     }
+  }
+
+  const cancelJob = async (id, e) => {
+    e.stopPropagation()
+    await api.cancelJob(id).catch(() => {})
+    api.getJobs().then(setJobs)
   }
 
   const deleteJob = async (id, e) => {
@@ -98,11 +151,7 @@ export function Jobs() {
                 onChange={e => setForm(f => ({ ...f, provider: e.target.value }))}
                 className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
               >
-                <option value="imap:0">IMAP 账户 1</option>
-                <option value="imap:1">IMAP 账户 2</option>
-                <option value="gptmail">GptMail</option>
-                <option value="npcmail">NpcMail</option>
-                <option value="yydsmail">YYDSMail</option>
+                {providerOpts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
               </select>
             </label>
             {startErr && <p className="text-xs text-red-500">{startErr}</p>}
@@ -145,6 +194,13 @@ export function Jobs() {
                   <div className="flex items-center gap-2 flex-shrink-0 ml-4">
                     {j.status === 'running' && <Spinner />}
                     <span className="text-xs text-gray-400">{elapsed(j.started)}</span>
+                    {j.status === 'running' && (
+                      <button
+                        onClick={e => cancelJob(j.id, e)}
+                        className="text-xs text-orange-400 hover:text-orange-600 border border-orange-200 hover:border-orange-400 px-1.5 py-0.5 rounded transition-colors"
+                        title="取消任务"
+                      >取消</button>
+                    )}
                     <button
                       onClick={e => deleteJob(j.id, e)}
                       className="text-gray-300 hover:text-red-500 transition-colors text-base"
@@ -170,6 +226,12 @@ export function Jobs() {
                 <span>进度: {detail.done}/{detail.count}</span>
                 <span>成功: {detail.success}</span>
                 <StatusBadge status={detail.status} />
+                {detail.status === 'running' && (
+                  <button
+                    onClick={e => cancelJob(selected, e)}
+                    className="text-xs text-orange-500 hover:text-orange-700 border border-orange-200 hover:border-orange-400 px-2 py-0.5 rounded transition-colors font-medium"
+                  >⛔ 取消任务</button>
+                )}
               </div>
             )}
           </div>

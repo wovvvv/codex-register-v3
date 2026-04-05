@@ -19,6 +19,7 @@ _SECTIONS = [
     "mail.npcmail",
     "mail.yydsmail",
     "mail.imap",
+    "mail.outlook",
     "registration",
     "team",
     "sync",
@@ -29,10 +30,11 @@ _SECTIONS = [
 ]
 
 _DEFAULTS: dict[str, Any] = {
-    "mail.gptmail": {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
-    "mail.npcmail": {"api_key": "", "base_url": "https://dash.xphdfs.me"},
+    "mail.gptmail":  {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
+    "mail.npcmail":  {"api_key": "", "base_url": "https://dash.xphdfs.me"},
     "mail.yydsmail": {"api_key": "", "base_url": "https://maliapi.215.im/v1"},
-    "mail.imap": [],
+    "mail.imap":     [],
+    "mail.outlook":  [],
     "registration": {"prefix": "", "domain": ""},
     "team": {"url": "", "key": ""},
     "sync": {"url": "", "key": ""},
@@ -182,6 +184,8 @@ async def build_config() -> dict[str, Any]:
             mail[provider] = db[key]
     if db.get("mail.imap") is not None:
         mail["imap"] = db["mail.imap"]
+    if db.get("mail.outlook") is not None:
+        mail["outlook"] = db["mail.outlook"]
 
     # Other non-common sections
     for section in ("registration", "team", "sync", "mouse", "timeouts", "timing"):

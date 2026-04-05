@@ -27,6 +27,13 @@ const api = {
   saveSection:        (s, data)     => req('POST', `/settings/${encodeURIComponent(s)}`, data),
   getMergedConfig:    ()            => req('GET',  '/settings_merged'),
 
+  // ── Mail import ──────────────────────────────────────────────────────────
+  parseImapAccounts:    (text)     => req('POST', '/mail/import/imap',          { text }),
+  parseImapAccountsNew: (text)     => req('POST', '/mail/import/imap/accounts', { text }),
+  saveImapAccounts:     (accounts) => req('POST', '/mail/import/imap/save',     { accounts }),
+  parseOutlookAccounts: (text)     => req('POST', '/mail/import/outlook',       { text }),
+  saveOutlookAccounts:  (accounts) => req('POST', '/mail/import/outlook/save',  { accounts }),
+
   // ── Accounts ─────────────────────────────────────────────────────────
   getAccounts: (params = {}) => req('GET', '/accounts?' + new URLSearchParams(params)),
   getStats:    ()            => req('GET', '/accounts/stats'),
@@ -36,6 +43,7 @@ const api = {
   getJobs:   ()     => req('GET',    '/jobs'),
   getJob:    (id)   => req('GET',    `/jobs/${id}`),
   startJob:  (data) => req('POST',   '/jobs', data),
+  cancelJob: (id)   => req('POST',   `/jobs/${id}/cancel`),
   deleteJob: (id)   => req('DELETE', `/jobs/${id}`),
 
   // ── Proxies ──────────────────────────────────────────────────────────

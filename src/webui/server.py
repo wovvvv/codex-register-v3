@@ -1,0 +1,573 @@
+"""
+webui/server.py — FastAPI backend for the ChatGPT register WebUI.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import urllib.parse
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Optional
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
+from loguru import logger
+
+import src.config as cfg_mod
+import src.db as db_mod
+import src.accounts as accounts_mod
+import src.proxy_pool as proxy_pool_mod
+import src.settings_db as settings_db
+from src.mail import get_mail_client
+from src.mail.imap import IMAPMailClient
+from src.mail.outlook import OutlookMailClient
+from src.browser.register import register_one
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db_mod.init()
+    await settings_db.init_from_yaml()
+    yield
+
+
+app = FastAPI(title="ChatGPT Register WebUI", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+# ── Job registry ──────────────────────────────────────────────────────────
+
+class _Job:
+    def __init__(self, job_id: str, count: int, provider: str, engine: str, proxy_mode: str):
+        self.id         = job_id
+        self.count      = count
+        self.provider   = provider
+        self.engine     = engine
+        self.proxy_mode = proxy_mode
+        self.status     = "running"
+        self.logs: list[str] = []
+        self.results: list[dict] = []
+        self.started    = time.time()
+        self.task: Optional[asyncio.Task] = None
+
+    def log(self, msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{ts}] {msg}")
+
+    def to_dict(self, full: bool = False) -> dict:
+        d: dict[str, Any] = {
+            "id":        self.id,
+            "count":     self.count,
+            "provider":  self.provider,
+            "engine":    self.engine,
+            "status":    self.status,
+            "started":   self.started,
+            "log_count": len(self.logs),
+            "done":      len(self.results),
+            "success":   sum(1 for r in self.results if r.get("status") == "注册完成"),
+        }
+        if full:
+            d["logs"]    = self.logs
+            d["results"] = self.results
+        return d
+
+
+_jobs: dict[str, _Job] = {}
+
+
+# ── Background runner ─────────────────────────────────────────────────────
+
+async def _run_job(job: _Job) -> None:
+    try:
+        cfg = await settings_db.build_config()
+        cfg["engine"] = job.engine
+
+        strategy     = cfg.get("proxy_strategy", "none")
+        static_proxy = cfg.get("proxy_static") or None
+        max_concurrent = int(cfg.get("max_concurrent", 2))
+        sem = asyncio.Semaphore(max_concurrent)
+
+        imap_raw = (cfg.get("mail") or {}).get("imap", [])
+        out_raw  = (cfg.get("mail") or {}).get("outlook", [])
+
+        # Detect new IMAP format: provider objects with "accounts" sub-list
+        _is_new_imap = bool(imap_raw) and isinstance(imap_raw[0], dict) and "accounts" in imap_raw[0]
+        provider_lower = job.provider.lower()
+        _is_imap_provider = provider_lower.startswith("imap:") and _is_new_imap
+        _is_outlook       = provider_lower.startswith("outlook")
+
+        # Build shared client for API providers and old-format IMAP
+        _shared_client = None
+        if not _is_imap_provider and not _is_outlook:
+            provider_base = job.provider.split(":")[0]
+            mail_raw = (cfg.get("mail") or {}).get(provider_base, {})
+            api_key  = "" if isinstance(mail_raw, list) else mail_raw.get("api_key", "")
+            base_url = "" if isinstance(mail_raw, list) else mail_raw.get("base_url", "")
+            _shared_client = get_mail_client(job.provider, api_key=api_key, base_url=base_url, cfg=cfg)
+
+        def _get_mail_client(n: int):
+            if _is_imap_provider:
+                provider_idx = int(job.provider.split(":")[1])
+                if provider_idx >= len(imap_raw):
+                    raise ValueError(f"IMAP 服务商索引 {provider_idx} 不存在（共 {len(imap_raw)} 个）")
+                prov     = imap_raw[provider_idx]
+                accounts = prov.get("accounts", [])
+                if not accounts:
+                    raise ValueError(f"IMAP 服务商 {provider_idx} ({prov.get('name','?')}) 没有配置账户")
+                acc       = accounts[(n - 1) % len(accounts)]
+                auth_type = prov.get("auth_type", "password")
+                cred      = acc.get("credential", "")
+                return IMAPMailClient(
+                    email        = acc.get("email", ""),
+                    password     = cred if auth_type == "password" else "",
+                    host         = prov.get("host", ""),
+                    port         = int(prov.get("port", 993)),
+                    ssl          = bool(prov.get("ssl", True)),
+                    folder       = prov.get("folder", "INBOX"),
+                    use_alias    = prov.get("use_alias"),
+                    auth_type    = auth_type,
+                    access_token = cred if auth_type == "oauth2" else "",
+                )
+            elif _is_outlook:
+                if not out_raw:
+                    raise ValueError("没有配置 Outlook 账户")
+                acc = out_raw[(n - 1) % len(out_raw)]
+                return OutlookMailClient(
+                    email         = acc.get("email", ""),
+                    client_id     = acc.get("client_id", ""),
+                    tenant_id     = acc.get("tenant_id", "consumers"),
+                    refresh_token = acc.get("refresh_token", ""),
+                    access_token  = acc.get("access_token", ""),
+                    fetch_method  = acc.get("fetch_method", "graph"),
+                )
+            else:
+                return _shared_client
+
+        job.log(f"Starting {job.count} task(s) — engine={job.engine} provider={job.provider}")
+
+        async def _one(n: int) -> None:
+            async with sem:
+                if job.status == "cancelled":
+                    return
+
+                proxy: Optional[str] = None
+                if strategy == "static" and static_proxy:
+                    proxy = static_proxy
+                elif strategy == "pool":
+                    proxy = await proxy_pool_mod.acquire()
+
+                try:
+                    mail_client = _get_mail_client(n)
+                except Exception as exc:
+                    job.log(f"Task {n}/{job.count} 邮件客户端错误: {exc}")
+                    return
+
+                job.log(f"Task {n}/{job.count} 启动  proxy={'yes' if proxy else 'none'}")
+                try:
+                    result = await register_one(
+                        task_id   = f"{job.id}-{n}",
+                        cfg       = cfg,
+                        mail_client = mail_client,
+                        proxy     = proxy,
+                        log_fn    = lambda msg, _n=n: job.log(f"[任务{_n}] {msg}"),
+                    )
+                    await accounts_mod.upsert(result)
+                    job.results.append(result)
+                    st = result.get("status", "?")
+                    job.log(f"Task {n}/{job.count} → {result.get('email', '?')} [{st}]")
+                    if strategy == "pool" and proxy:
+                        await proxy_pool_mod.report_result(proxy, st == "注册完成")
+                except asyncio.CancelledError:
+                    job.log(f"Task {n}/{job.count} 已取消")
+                    raise
+                except Exception as exc:
+                    job.log(f"Task {n}/{job.count} 错误: {exc}")
+
+        await asyncio.gather(
+            *[asyncio.create_task(_one(i + 1)) for i in range(job.count)],
+            return_exceptions=True,
+        )
+        if job.status != "cancelled":
+            job.status = "done"
+        d = job.to_dict()
+        job.log(f"全部完成 — {d['success']}/{job.count} 成功")
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        job.log("任务已被用户取消")
+    except Exception as exc:
+        job.status = "error"
+        job.log(f"Fatal: {exc}")
+        logger.exception(f"[webui] Job {job.id} fatal")
+
+
+# ── Config API (YAML-backed, common settings) ─────────────────────────────
+
+@app.get("/api/config")
+async def api_get_config():
+    return cfg_mod.load()
+
+
+@app.post("/api/config")
+async def api_set_config(request: Request):
+    body: dict = await request.json()
+    for key, value in body.items():
+        cfg_mod.set_key(key, value)
+    return {"ok": True}
+
+
+# ── Settings API (DB-backed, non-common settings) ─────────────────────────
+
+@app.get("/api/settings")
+async def api_get_settings():
+    return await settings_db.get_all()
+
+
+@app.get("/api/settings/{section:path}")
+async def api_get_settings_section(section: str):
+    return await settings_db.get_section(section)
+
+
+@app.post("/api/settings/{section:path}")
+async def api_set_settings_section(section: str, request: Request):
+    value = await request.json()
+    await settings_db.set_section(section, value)
+    return {"ok": True}
+
+
+@app.get("/api/settings_merged")
+async def api_settings_merged():
+    """Return fully merged config (YAML + DB) as used by registration jobs."""
+    return await settings_db.build_config()
+
+
+# ── Mail import helpers ───────────────────────────────────────────────────
+
+def _parse_imap_text(text: str) -> list[dict]:
+    """
+    Parse bulk IMAP account text into account dicts.
+
+    Supported formats (one account per non-blank, non-comment line):
+      email<TAB>password[<TAB>host[<TAB>port[<TAB>ssl]]]
+      email----password[----host[----port[----ssl]]]
+      JSON array: [{email, password, host, ...}]
+    """
+    import json
+    stripped = text.strip()
+    if stripped.startswith("["):
+        raw = json.loads(stripped)
+        if not isinstance(raw, list):
+            raise ValueError("JSON must be an array")
+        return raw
+
+    results = []
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Try "----" separator first, then tab, then whitespace
+        if "----" in line:
+            parts = [p.strip() for p in line.split("----")]
+        elif "\t" in line:
+            parts = [p.strip() for p in line.split("\t")]
+        else:
+            parts = line.split(None, 4)
+
+        if len(parts) < 2:
+            continue
+
+        email    = parts[0]
+        password = parts[1]
+        host     = parts[2] if len(parts) > 2 else ""
+        port_s   = parts[3] if len(parts) > 3 else "993"
+        ssl_s    = parts[4] if len(parts) > 4 else "true"
+        try:
+            port = int(port_s)
+        except ValueError:
+            port = 993
+        ssl = ssl_s.lower() not in ("false", "0", "no")
+
+        acc: dict = {"email": email, "password": password, "port": port, "ssl": ssl,
+                     "folder": "INBOX", "auth_type": "password", "access_token": ""}
+        if host:
+            acc["host"] = host
+        results.append(acc)
+    return results
+
+
+def _parse_outlook_text(text: str) -> list[dict]:
+    """
+    Parse bulk Outlook account text into account dicts.
+
+    Supported formats:
+      JSON array: [{email, client_id, tenant_id, refresh_token, fetch_method}]
+      四短线分隔 (one per line): email----password----client_id----refresh_token[----fetch_method]
+      Pipe-separated (one per line): email|client_id|tenant_id|refresh_token[|fetch_method]
+    """
+    import json
+    stripped = text.strip()
+    if stripped.startswith("["):
+        raw = json.loads(stripped)
+        if not isinstance(raw, list):
+            raise ValueError("JSON must be an array")
+        return raw
+
+    results = []
+    for line in stripped.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if "----" in line:
+            # Format: email----password----client_id----refresh_token[----fetch_method]
+            parts = [p.strip() for p in line.split("----")]
+            if len(parts) < 4:
+                continue
+            results.append({
+                "email":         parts[0],
+                "password":      parts[1],
+                "client_id":     parts[2],
+                "tenant_id":     "consumers",
+                "refresh_token": parts[3],
+                "access_token":  "",
+                "fetch_method":  parts[4] if len(parts) > 4 else "graph",
+            })
+        else:
+            # Pipe-separated: email|client_id|tenant_id|refresh_token[|fetch_method]
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 4:
+                continue
+            results.append({
+                "email":         parts[0],
+                "password":      "",
+                "client_id":     parts[1],
+                "tenant_id":     parts[2] or "consumers",
+                "refresh_token": parts[3],
+                "access_token":  "",
+                "fetch_method":  parts[4] if len(parts) > 4 else "graph",
+            })
+    return results
+
+
+@app.post("/api/mail/import/imap")
+async def api_import_imap(request: Request):
+    """Parse and append bulk IMAP accounts. Returns parsed list for preview."""
+    body = await request.json()
+    text = body.get("text", "")
+    try:
+        parsed = _parse_imap_text(text)
+    except Exception as e:
+        raise HTTPException(400, f"Parse error: {e}")
+    return {"parsed": parsed, "count": len(parsed)}
+
+
+@app.post("/api/mail/import/imap/accounts")
+async def api_parse_imap_accounts(request: Request):
+    """
+    Parse simple email+credential text for the new provider-based IMAP format.
+    Returns [{email, credential}] pairs.
+    """
+    body = await request.json()
+    text = body.get("text", "").strip()
+    results = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "----" in line:
+            parts = [p.strip() for p in line.split("----", 1)]
+        elif "\t" in line:
+            parts = line.split("\t", 1)
+        else:
+            parts = line.split(None, 1)
+        if len(parts) >= 2:
+            results.append({"email": parts[0].strip(), "credential": parts[1].strip()})
+        elif len(parts) == 1 and "@" in parts[0]:
+            results.append({"email": parts[0].strip(), "credential": ""})
+    return {"parsed": results, "count": len(results)}
+
+
+@app.post("/api/mail/import/imap/save")
+async def api_import_imap_save(request: Request):
+    """Append parsed IMAP accounts to the DB section."""
+    body    = await request.json()
+    new_acc = body.get("accounts", [])
+    existing = await settings_db.get_section("mail.imap")
+    if not isinstance(existing, list):
+        existing = []
+    # Deduplicate by email
+    existing_emails = {a.get("email", "").lower() for a in existing}
+    added = [a for a in new_acc if a.get("email", "").lower() not in existing_emails]
+    await settings_db.set_section("mail.imap", existing + added)
+    return {"added": len(added), "total": len(existing) + len(added)}
+
+
+@app.post("/api/mail/import/outlook")
+async def api_import_outlook(request: Request):
+    """Parse bulk Outlook accounts. Returns parsed list for preview."""
+    body = await request.json()
+    text = body.get("text", "")
+    try:
+        parsed = _parse_outlook_text(text)
+    except Exception as e:
+        raise HTTPException(400, f"Parse error: {e}")
+    return {"parsed": parsed, "count": len(parsed)}
+
+
+@app.post("/api/mail/import/outlook/save")
+async def api_import_outlook_save(request: Request):
+    """Append parsed Outlook accounts to the DB section."""
+    body     = await request.json()
+    new_acc  = body.get("accounts", [])
+    existing = await settings_db.get_section("mail.outlook")
+    if not isinstance(existing, list):
+        existing = []
+    existing_emails = {a.get("email", "").lower() for a in existing}
+    added = [a for a in new_acc if a.get("email", "").lower() not in existing_emails]
+    await settings_db.set_section("mail.outlook", existing + added)
+    return {"added": len(added), "total": len(existing) + len(added)}
+
+
+# ── Accounts API ──────────────────────────────────────────────────────────
+
+@app.get("/api/accounts")
+async def api_accounts(status: str = "", limit: int = 200, offset: int = 0):
+    rows = await accounts_mod.list_all(status or None)
+    return {"total": len(rows), "items": rows[offset: offset + limit]}
+
+
+@app.get("/api/accounts/stats")
+async def api_account_stats():
+    rows = await accounts_mod.list_all()
+    counts: dict[str, int] = {}
+    for r in rows:
+        s = r.get("status", "unknown")
+        counts[s] = counts.get(s, 0) + 1
+    counts["total"] = len(rows)
+    return counts
+
+
+@app.get("/api/accounts/export")
+async def api_export(fmt: str = "json"):
+    rows = await accounts_mod.list_all()
+    if fmt == "csv":
+        import io, csv
+        buf = io.StringIO()
+        if rows:
+            w = csv.DictWriter(buf, fieldnames=rows[0].keys())
+            w.writeheader()
+            w.writerows(rows)
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=accounts.csv"},
+        )
+    return Response(
+        content=json.dumps(rows, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=accounts.json"},
+    )
+
+
+# ── Jobs API ──────────────────────────────────────────────────────────────
+
+@app.post("/api/jobs")
+async def api_start_job(request: Request):
+    body: dict = await request.json()
+    cfg = await settings_db.build_config()
+    count    = int(body.get("count", 1))
+    provider = body.get("provider") or cfg.get("mail_provider", "gptmail")
+    engine   = body.get("engine")   or cfg.get("engine", "playwright")
+
+    job_id = str(uuid.uuid4())[:8]
+    job = _Job(job_id, count, provider, engine, cfg.get("proxy_strategy", "none"))
+    _jobs[job_id] = job
+    job.task = asyncio.create_task(_run_job(job))
+    return {"job_id": job_id}
+
+
+@app.get("/api/jobs")
+async def api_list_jobs():
+    return [j.to_dict() for j in reversed(list(_jobs.values()))]
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job.to_dict(full=True)
+
+
+@app.delete("/api/jobs/{job_id}")
+async def api_delete_job(job_id: str):
+    job = _jobs.pop(job_id, None)
+    if job and job.task and not job.task.done():
+        job.task.cancel()
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_cancel_job(job_id: str):
+    """Cancel a running job without removing it from the list."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    job.status = "cancelled"
+    if job.task and not job.task.done():
+        job.task.cancel()
+    job.log("⛔ 用户取消了任务")
+    return {"ok": True}
+
+
+# ── Proxies API ───────────────────────────────────────────────────────────
+
+@app.get("/api/proxies")
+async def api_proxies():
+    return await proxy_pool_mod.list_all()
+
+
+@app.post("/api/proxies")
+async def api_add_proxy(request: Request):
+    body: dict = await request.json()
+    addr = body.get("address", "").strip()
+    if not addr:
+        raise HTTPException(400, "address required")
+    await proxy_pool_mod.add(addr)
+    return {"ok": True}
+
+
+@app.delete("/api/proxies/{address:path}")
+async def api_delete_proxy(address: str):
+    await proxy_pool_mod.remove(urllib.parse.unquote(address))
+    return {"ok": True}
+
+
+# ── SPA ───────────────────────────────────────────────────────────────────
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/{path:path}")
+async def serve_spa(path: str):
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        return HTMLResponse(
+            "<h1>WebUI not built yet.</h1><p>Run: <code>cd webui_frontend &amp;&amp; npm install &amp;&amp; npm run build</code></p>",
+            status_code=503,
+        )
+    html = index.read_text(encoding="utf-8")
+    return HTMLResponse(html)
+
+
+# ── Start ─────────────────────────────────────────────────────────────────
+
+def run(host: str = "0.0.0.0", port: int = 7860) -> None:
+    uvicorn.run("src.webui.server:app", host=host, port=port, log_level="warning")
