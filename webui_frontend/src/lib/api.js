@@ -35,21 +35,25 @@ const api = {
   saveOutlookAccounts:  (accounts) => req('POST', '/mail/import/outlook/save',  { accounts }),
 
   // ── Accounts ─────────────────────────────────────────────────────────
-  getAccounts: (params = {}) => req('GET', '/accounts?' + new URLSearchParams(params)),
-  getStats:    ()            => req('GET', '/accounts/stats'),
-  exportUrl:   (fmt)         => `${BASE}/accounts/export?fmt=${fmt}`,
+  getAccounts:        (params = {}) => req('GET',    '/accounts?' + new URLSearchParams(params)),
+  getStats:           ()            => req('GET',    '/accounts/stats'),
+  exportUrl:          (fmt)         => `${BASE}/accounts/export?fmt=${fmt}`,
+  deleteAccount:      (email)       => req('DELETE', `/accounts/${encodeURIComponent(email)}`),
+  batchDeleteAccounts:(body)        => req('POST',   '/accounts/batch-delete', body),
 
   // ── Jobs ─────────────────────────────────────────────────────────────
-  getJobs:   ()     => req('GET',    '/jobs'),
-  getJob:    (id)   => req('GET',    `/jobs/${id}`),
-  startJob:  (data) => req('POST',   '/jobs', data),
-  cancelJob: (id)   => req('POST',   `/jobs/${id}/cancel`),
-  deleteJob: (id)   => req('DELETE', `/jobs/${id}`),
+  getJobs:         ()     => req('GET',    '/jobs'),
+  getJob:          (id)   => req('GET',    `/jobs/${id}`),
+  startJob:        (data) => req('POST',   '/jobs', data),
+  cancelJob:       (id)   => req('POST',   `/jobs/${id}/cancel`),
+  deleteJob:       (id)   => req('DELETE', `/jobs/${id}`),
+  batchJobsAction: (body) => req('POST',   '/jobs/batch-action', body),
 
   // ── Proxies ──────────────────────────────────────────────────────────
-  getProxies:   ()    => req('GET',    '/proxies'),
-  addProxy:     (addr)=> req('POST',   '/proxies', { address: addr }),
-  deleteProxy:  (addr)=> req('DELETE', `/proxies/${encodeURIComponent(addr)}`),
+  getProxies:         ()     => req('GET',    '/proxies'),
+  addProxy:           (addr) => req('POST',   '/proxies', { address: addr }),
+  deleteProxy:        (addr) => req('DELETE', `/proxies/${encodeURIComponent(addr)}`),
+  batchDeleteProxies: (body) => req('POST',   '/proxies/batch-delete', body),
 }
 
 export default api

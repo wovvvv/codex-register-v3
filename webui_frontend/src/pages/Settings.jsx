@@ -1,7 +1,11 @@
 // pages/Settings.jsx
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef, createContext, useContext, useMemo } from 'react'
 import api from '../lib/api.js'
 import { Spinner } from '../components/Badge.jsx'
+
+// ── Sticky save context ───────────────────────────────────────────────────
+// Tabs register their save function here so the sticky header can call it.
+const SaveCtx = createContext(null)
 
 // ── Shared helpers ────────────────────────────────────────────────────────
 
@@ -79,17 +83,45 @@ function SaveBtn({ onClick, saving, saved, error }) {
   )
 }
 
-function useSave() {
+function useSave(isolated = false) {
+  const rawCtx = useContext(SaveCtx)
+  // isolated=true → do not sync with sticky header (e.g. per-section mail saves)
+  const ctxRef = useRef(null)
+  useEffect(() => { ctxRef.current = isolated ? null : rawCtx }, [rawCtx, isolated])
+
   const [saving, setSaving] = useState(false)
   const [saved, setSaved]   = useState(false)
   const [error, setError]   = useState('')
-  const run = async (fn) => {
+
+  // Stable run function (uses ref to avoid stale closures)
+  const run = useCallback(async (fn) => {
     setSaving(true); setSaved(false); setError('')
-    try { await fn(); setSaved(true); setTimeout(() => setSaved(false), 2500) }
-    catch (e) { setError(e.message) }
-    finally { setSaving(false) }
-  }
-  return { saving, saved, error, run }
+    ctxRef.current?.onState({ saving: true, saved: false, error: '' })
+    try {
+      await fn()
+      setSaved(true); setTimeout(() => setSaved(false), 2500)
+      ctxRef.current?.onState({ saving: false, saved: true, error: '' })
+      setTimeout(() => ctxRef.current?.onState({ saving: false, saved: false, error: '' }), 2500)
+    } catch (e) {
+      setError(e.message)
+      ctxRef.current?.onState({ saving: false, saved: false, error: e.message })
+    } finally { setSaving(false) }
+  }, [])
+
+  // Register the tab's save function with the sticky header
+  const registerSave = useCallback((fn) => {
+    ctxRef.current?.registerSave(fn)
+  }, [])
+
+  return { saving, saved, error, run, registerSave }
+}
+
+// ── Indeterminate Checkbox ────────────────────────────────────────────────
+
+function IndeterminateCheckbox({ indeterminate, className = '', ...props }) {
+  const ref = useRef(null)
+  useEffect(() => { if (ref.current) ref.current.indeterminate = !!indeterminate }, [indeterminate])
+  return <input type="checkbox" ref={ref} className={`rounded cursor-pointer accent-blue-600 ${className}`} {...props} />
 }
 
 // ── Import Modal ──────────────────────────────────────────────────────────
@@ -194,23 +226,65 @@ function ImportModal({ title, placeholder, hint, onParse, onImport, onClose }) {
   )
 }
 
+function useProviderOptions() {
+  const [opts, setOpts] = useState([
+    ['imap:0', 'IMAP 服务商 1'], ['gptmail', 'GptMail'],
+  ])
+  useEffect(() => {
+    api.getSettings().then(s => {
+      const items = []
+      const imapProviders = Array.isArray(s['mail.imap']) ? s['mail.imap'] : []
+      const isNewFormat = imapProviders.length > 0 && 'accounts' in imapProviders[0]
+      if (isNewFormat) {
+        imapProviders.forEach((prov, i) => {
+          const name = prov.name || `IMAP 服务商 ${i + 1}`
+          const accs = Array.isArray(prov.accounts) ? prov.accounts : []
+          items.push([`imap:${i}`, `${name}（全部 ${accs.length} 账户轮换）`])
+          accs.forEach((acc, j) => {
+            items.push([`imap:${i}:${j}`, `└ ${acc.email || `账户 ${j + 1}`}`])
+          })
+        })
+      } else {
+        imapProviders.forEach((acc, i) =>
+          items.push([`imap:${i}`, acc.email ? `IMAP: ${acc.email}` : `IMAP 账户 ${i + 1}`])
+        )
+      }
+      if (items.filter(([v]) => v.startsWith('imap')).length === 0)
+        items.push(['imap:0', 'IMAP 服务商 1'])
+      const outlookAccounts = Array.isArray(s['mail.outlook']) ? s['mail.outlook'] : []
+      if (outlookAccounts.length > 0) {
+        items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
+        outlookAccounts.forEach((acc, i) => {
+          items.push([`outlook:${i}`, `└ ${acc.email || `Outlook 账户 ${i + 1}`}`])
+        })
+      }
+      items.push(['gptmail', 'GptMail'], ['npcmail', 'NpcMail'], ['yydsmail', 'YYDSMail'])
+      setOpts(items)
+    }).catch(() => {})
+  }, [])
+  return opts
+}
+
 // ── Tab: General ──────────────────────────────────────────────────────────
 
 function TabGeneral() {
   const [cfg, setCfg] = useState(null)
-  const { saving, saved, error, run } = useSave()
+  const { run, registerSave } = useSave()
+  const providerOpts = useProviderOptions()
 
   useEffect(() => { api.getConfig().then(setCfg).catch(() => {}) }, [])
   const set = (k, v) => setCfg(c => ({ ...c, [k]: v }))
 
-  const save = () => run(async () => {
+  const save = useCallback(() => run(async () => {
     await api.saveConfig({
       engine: cfg.engine, headless: cfg.headless, mobile: cfg.mobile,
       max_concurrent: cfg.max_concurrent, slow_mo: cfg.slow_mo,
       mail_provider: cfg.mail_provider, proxy_strategy: cfg.proxy_strategy,
       proxy_static: cfg.proxy_static ?? '',
     })
-  })
+  }), [run, cfg])
+
+  useEffect(() => { registerSave(save) }, [save, registerSave])
 
   if (!cfg) return <div className="py-8 text-center text-gray-400"><Spinner size="md" /></div>
 
@@ -233,11 +307,7 @@ function TabGeneral() {
         </Field>
         <Field label="默认邮件服务商">
           <Select value={cfg.mail_provider ?? 'imap:0'} onChange={e => set('mail_provider', e.target.value)}
-            options={[
-              ['imap:0','IMAP 账户 1'],['imap:1','IMAP 账户 2'],['imap:2','IMAP 账户 3'],
-              ['outlook:0','Outlook 账户 1'],['outlook:1','Outlook 账户 2'],
-              ['gptmail','GptMail'],['npcmail','NpcMail'],['yydsmail','YYDSMail'],
-            ]} />
+            options={providerOpts} />
         </Field>
       </Section>
       <Section title="代理配置">
@@ -251,7 +321,6 @@ function TabGeneral() {
           </Field>
         )}
       </Section>
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </div>
   )
 }
@@ -260,7 +329,7 @@ function TabGeneral() {
 
 function MailProviderSection({ name, label }) {
   const [data, setData] = useState({ api_key: '', base_url: '' })
-  const { saving, saved, error, run } = useSave()
+  const { saving, saved, error, run } = useSave(true)  // isolated — has its own save button
   useEffect(() => { api.getSection(`mail.${name}`).then(setData).catch(() => {}) }, [name])
   const save = () => run(() => api.saveSection(`mail.${name}`, data))
   return (
@@ -374,45 +443,69 @@ function ImapAccountImportModal({ onImport, onClose }) {
 
 function TabImap() {
   const [providers, setProviders] = useState([])
-  const [importForIdx, setImportForIdx] = useState(null)  // which provider to import into
+  const [importForIdx, setImportForIdx] = useState(null)
   const [collapsed, setCollapsed] = useState({})
-  const { saving, saved, error, run } = useSave()
+  const [imapSel, setImapSel] = useState({})   // { [pi]: Set<accountIndex> }
+  const { run, registerSave } = useSave()
 
   const load = useCallback(() => {
     api.getSection('mail.imap').then(d => {
       const raw = Array.isArray(d) ? d : []
-      // Auto-migrate old flat format to new provider+accounts format
       if (raw.length > 0 && !('accounts' in raw[0])) {
-        // Old format: each item is an account, wrap into one default provider
         setProviders([{
           ...EMPTY_IMAP_PROVIDER,
           name: '默认 IMAP 服务商',
-          accounts: raw.map(a => ({
-            email: a.email || '',
-            credential: a.password || a.access_token || '',
-          })),
+          accounts: raw.map(a => ({ email: a.email || '', credential: a.password || a.access_token || '' })),
         }])
       } else {
         setProviders(raw)
       }
+      setImapSel({})
     }).catch(() => {})
   }, [])
   useEffect(() => { load() }, [load])
 
-  const save = () => run(() => api.saveSection('mail.imap', providers))
+  const save = useCallback(() => run(() => api.saveSection('mail.imap', providers)), [run, providers])
+  useEffect(() => { registerSave(save) }, [save, registerSave])
 
-  // Provider-level helpers
+  // Provider helpers
   const addProvider    = () => setProviders(p => [...p, { ...EMPTY_IMAP_PROVIDER, accounts: [] }])
-  const removeProvider = (pi) => setProviders(p => p.filter((_, i) => i !== pi))
+  const removeProvider = (pi) => { setProviders(p => p.filter((_, i) => i !== pi)); setImapSel(s => { const n={...s}; delete n[pi]; return n }) }
   const updateProvider = (pi, k, v) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, [k]: v } : prov))
   const toggleCollapse = (pi) => setCollapsed(c => ({ ...c, [pi]: !c[pi] }))
 
-  // Account-level helpers
+  // Account helpers
   const addAccount    = (pi) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: [...prov.accounts, { ...EMPTY_IMAP_ACCOUNT }] } : prov))
-  const removeAccount = (pi, ai) => setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: prov.accounts.filter((_, j) => j !== ai) } : prov))
+  const removeAccount = (pi, ai) => {
+    setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: prov.accounts.filter((_, j) => j !== ai) } : prov))
+    setImapSel(s => { const prev = s[pi] || new Set(); const next = new Set([...prev].filter(x => x !== ai).map(x => x > ai ? x - 1 : x)); return { ...s, [pi]: next } })
+  }
   const updateAccount = (pi, ai, k, v) => setProviders(p => p.map((prov, i) =>
     i === pi ? { ...prov, accounts: prov.accounts.map((acc, j) => j === ai ? { ...acc, [k]: v } : acc) } : prov
   ))
+
+  // Bulk selection helpers per provider
+  const pSel     = (pi) => imapSel[pi] || new Set()
+  const pAllSel  = (pi, accs) => accs.length > 0 && accs.every((_, ai) => pSel(pi).has(ai))
+  const pSomeSel = (pi, accs) => !pAllSel(pi, accs) && accs.some((_, ai) => pSel(pi).has(ai))
+
+  const toggleImapRow = (pi, ai) => setImapSel(s => {
+    const prev = s[pi] || new Set(); const next = new Set(prev)
+    next.has(ai) ? next.delete(ai) : next.add(ai)
+    return { ...s, [pi]: next }
+  })
+  const toggleImapAll = (pi, accs) => setImapSel(s => {
+    const prev = s[pi] || new Set()
+    const all = pAllSel(pi, accs)
+    const next = all ? new Set() : new Set(accs.map((_, ai) => ai))
+    return { ...s, [pi]: next }
+  })
+  const deleteImapSelected = (pi) => {
+    const selected = pSel(pi)
+    if (selected.size === 0) return
+    setProviders(p => p.map((prov, i) => i === pi ? { ...prov, accounts: prov.accounts.filter((_, ai) => !selected.has(ai)) } : prov))
+    setImapSel(s => ({ ...s, [pi]: new Set() }))
+  }
 
   const handleImportAccounts = (pi, parsed) => {
     setProviders(p => p.map((prov, i) => {
@@ -436,7 +529,12 @@ function TabImap() {
 
       {providers.map((prov, pi) => {
         const isCollapsed = collapsed[pi]
-        const accCount = prov.accounts?.length || 0
+        const accs = prov.accounts || []
+        const accCount = accs.length
+        const selSet = pSel(pi)
+        const allSel = pAllSel(pi, accs)
+        const someSel = pSomeSel(pi, accs)
+
         return (
           <div key={pi} className="border border-gray-200 rounded-xl overflow-hidden">
             {/* Provider header */}
@@ -485,32 +583,61 @@ function TabImap() {
 
                 {/* Accounts sub-list */}
                 <div>
+                  {/* Account list header with bulk select */}
                   <div className="flex items-center justify-between mb-2">
-                    <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">账户列表 ({accCount})</p>
+                    <div className="flex items-center gap-2">
+                      {accCount > 0 && (
+                        <IndeterminateCheckbox
+                          checked={allSel}
+                          indeterminate={someSel}
+                          onChange={() => toggleImapAll(pi, accs)}
+                        />
+                      )}
+                      <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        账户列表 ({accCount})
+                      </p>
+                      {selSet.size > 0 && (
+                        <button
+                          onClick={() => deleteImapSelected(pi)}
+                          className="text-xs text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 px-2 py-0.5 rounded transition-colors"
+                        >
+                          🗑️ 删除所选 {selSet.size} 个
+                        </button>
+                      )}
+                    </div>
                     <button onClick={() => setImportForIdx(pi)}
                       className="text-xs bg-gray-100 hover:bg-gray-200 text-gray-600 px-2.5 py-1 rounded transition-colors">
                       📥 批量导入
                     </button>
                   </div>
 
-                  {(prov.accounts || []).map((acc, ai) => (
-                    <div key={ai} className="flex items-center gap-2 py-1.5 border-b border-gray-50 last:border-0">
-                      <input
-                        value={acc.email || ''}
-                        onChange={e => updateAccount(pi, ai, 'email', e.target.value)}
-                        placeholder="邮箱地址"
-                        className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                      />
-                      <input
-                        type="password"
-                        value={acc.credential || ''}
-                        onChange={e => updateAccount(pi, ai, 'credential', e.target.value)}
-                        placeholder={prov.auth_type === 'oauth2' ? 'Access Token' : '密码/授权码'}
-                        className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
-                      />
-                      <button onClick={() => removeAccount(pi, ai)} className="text-gray-300 hover:text-red-500 text-sm flex-shrink-0">×</button>
-                    </div>
-                  ))}
+                  {accs.map((acc, ai) => {
+                    const checked = selSet.has(ai)
+                    return (
+                      <div key={ai} className={`flex items-center gap-2 py-1.5 border-b border-gray-50 last:border-0 transition-colors ${checked ? 'bg-blue-50 -mx-1 px-1 rounded' : ''}`}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleImapRow(pi, ai)}
+                          className="rounded cursor-pointer accent-blue-600 flex-shrink-0"
+                        />
+                        <input
+                          value={acc.email || ''}
+                          onChange={e => updateAccount(pi, ai, 'email', e.target.value)}
+                          placeholder="邮箱地址"
+                          className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <input
+                          type="password"
+                          value={acc.credential || ''}
+                          onChange={e => updateAccount(pi, ai, 'credential', e.target.value)}
+                          placeholder={prov.auth_type === 'oauth2' ? 'Access Token' : '密码/授权码'}
+                          className="flex-1 min-w-0 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                        <button onClick={() => removeAccount(pi, ai)} className="text-gray-300 hover:text-red-500 text-sm flex-shrink-0">×</button>
+                      </div>
+                    )
+                  })}
 
                   <button onClick={() => addAccount(pi)}
                     className="mt-2 w-full border border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-lg py-1.5 text-xs transition-colors">
@@ -527,7 +654,6 @@ function TabImap() {
         className="w-full border-2 border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-xl py-3 text-sm transition-colors">
         + 添加 IMAP 服务商
       </button>
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
 
       {importForIdx !== null && (
         <ImapAccountImportModal
@@ -757,10 +883,11 @@ function TabOutlook() {
   const [accounts, setAccounts] = useState([])
   const [showImport, setShowImport] = useState(false)
   const [editIdx, setEditIdx] = useState(null)
-  const { saving, saved, error, run } = useSave()
+  const [sel, setSel] = useState(new Set())    // Set<index>
+  const { run, registerSave } = useSave()
 
   const load = useCallback(() => {
-    api.getSection('mail.outlook').then(d => setAccounts(Array.isArray(d) ? d : [])).catch(() => {})
+    api.getSection('mail.outlook').then(d => { setAccounts(Array.isArray(d) ? d : []); setSel(new Set()) }).catch(() => {})
   }, [])
   useEffect(() => { load() }, [load])
 
@@ -771,11 +898,31 @@ function TabOutlook() {
   }
   const remove = (i) => {
     setAccounts(a => a.filter((_, idx) => idx !== i))
+    setSel(s => { const n = new Set([...s].filter(x => x !== i).map(x => x > i ? x - 1 : x)); return n })
     if (editIdx === i) setEditIdx(null)
   }
   const updateAcc = (i, updated) => setAccounts(a => a.map((acc, idx) => idx === i ? updated : acc))
-  const save = () => run(() => api.saveSection('mail.outlook', accounts))
+  const save = useCallback(() => run(() => api.saveSection('mail.outlook', accounts)), [run, accounts])
+  useEffect(() => { registerSave(save) }, [save, registerSave])
   const handleImport = async (parsed) => { await api.saveOutlookAccounts(parsed); load() }
+
+  // Bulk selection
+  const allSel  = accounts.length > 0 && accounts.every((_, i) => sel.has(i))
+  const someSel = !allSel && accounts.some((_, i) => sel.has(i))
+
+  const toggleRow = (i) => setSel(s => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n })
+  const toggleAll = () => setSel(allSel ? new Set() : new Set(accounts.map((_, i) => i)))
+  const clearSel  = () => setSel(new Set())
+
+  const deleteSelected = () => {
+    if (!sel.size) return
+    if (!window.confirm(`确认删除 ${sel.size} 个 Outlook 账户？此操作在保存后生效。`)) return
+    const indices = [...sel].sort((a, b) => b - a)  // delete from end to preserve indices
+    let updated = [...accounts]
+    indices.forEach(i => { updated.splice(i, 1) })
+    setAccounts(updated)
+    clearSel()
+  }
 
   return (
     <div className="space-y-4">
@@ -788,10 +935,28 @@ function TabOutlook() {
         <p>· access_token 由系统自动刷新，无需手动填写</p>
       </div>
 
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-gray-600">
-          共 <span className="font-semibold text-blue-600">{accounts.length}</span> 个 Outlook 账户
-        </p>
+      {/* 工具栏 */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          {accounts.length > 0 && (
+            <IndeterminateCheckbox
+              checked={allSel}
+              indeterminate={someSel}
+              onChange={toggleAll}
+            />
+          )}
+          <p className="text-sm text-gray-600">
+            共 <span className="font-semibold text-blue-600">{accounts.length}</span> 个 Outlook 账户
+          </p>
+          {sel.size > 0 && (
+            <button
+              onClick={deleteSelected}
+              className="text-xs text-red-500 hover:text-red-700 bg-red-50 hover:bg-red-100 px-2.5 py-1 rounded transition-colors"
+            >
+              🗑️ 删除所选 {sel.size} 个
+            </button>
+          )}
+        </div>
         <button onClick={() => setShowImport(true)}
           className="text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1.5 rounded-lg transition-colors">
           📥 批量导入
@@ -803,74 +968,70 @@ function TabOutlook() {
         {accounts.length === 0 && (
           <p className="text-center text-sm text-gray-400 py-6">暂无账户，点击下方按钮添加</p>
         )}
-        {accounts.map((acc, i) => (
-          <div key={i}
-            className="border border-gray-100 rounded-xl px-4 py-3 flex items-center gap-3 hover:border-gray-200 bg-white transition-colors"
-          >
-            {/* 图标 */}
-            <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center flex-shrink-0 text-sm">
-              🔵
-            </div>
-            {/* 信息 */}
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-medium text-gray-800 truncate">
-                  {acc.email || <span className="text-gray-400 font-normal">未设置邮箱</span>}
-                </span>
-                <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${
-                  (acc.fetch_method || 'graph') === 'graph'
-                    ? 'bg-green-100 text-green-700'
-                    : 'bg-yellow-100 text-yellow-700'
-                }`}>
-                  {acc.fetch_method || 'graph'}
-                </span>
+        {accounts.map((acc, i) => {
+          const checked = sel.has(i)
+          return (
+            <div key={i}
+              className={`border rounded-xl px-4 py-3 flex items-center gap-3 bg-white transition-colors ${checked ? 'border-blue-200 bg-blue-50' : 'border-gray-100 hover:border-gray-200'}`}
+            >
+              {/* 复选框 */}
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={() => toggleRow(i)}
+                className="rounded cursor-pointer accent-blue-600 flex-shrink-0"
+              />
+              {/* 图标 */}
+              <div className="w-8 h-8 rounded-full bg-blue-50 flex items-center justify-center flex-shrink-0 text-sm">
+                🔵
               </div>
-              <p className="text-xs text-gray-400 mt-0.5 truncate">
-                {acc.client_id
-                  ? <span className="font-mono">client: {acc.client_id.slice(0, 8)}…</span>
-                  : <span className="text-orange-400">⚠ 未设置 Client ID</span>
-                }
-                {acc.refresh_token
-                  ? <span className="ml-2 text-green-600">✓ Refresh Token</span>
-                  : <span className="ml-2 text-orange-400">⚠ 未设置 Refresh Token</span>
-                }
-                {acc.password && <span className="ml-2">· 已设置密码</span>}
-              </p>
+              {/* 信息 */}
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-medium text-gray-800 truncate">
+                    {acc.email || <span className="text-gray-400 font-normal">未设置邮箱</span>}
+                  </span>
+                  <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${
+                    (acc.fetch_method || 'graph') === 'graph' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'
+                  }`}>
+                    {acc.fetch_method || 'graph'}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-400 mt-0.5 truncate">
+                  {acc.client_id
+                    ? <span className="font-mono">client: {acc.client_id.slice(0, 8)}…</span>
+                    : <span className="text-orange-400">⚠ 未设置 Client ID</span>
+                  }
+                  {acc.refresh_token
+                    ? <span className="ml-2 text-green-600">✓ Refresh Token</span>
+                    : <span className="ml-2 text-orange-400">⚠ 未设置 Refresh Token</span>
+                  }
+                  {acc.password && <span className="ml-2">· 已设置密码</span>}
+                </p>
+              </div>
+              {/* 操作 */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => setEditIdx(i)}
+                  className="text-xs text-blue-500 hover:text-blue-700 px-2.5 py-1 rounded border border-blue-100 hover:border-blue-300 transition-colors"
+                >
+                  详情 / 编辑
+                </button>
+                <button onClick={() => remove(i)} className="text-xs text-red-400 hover:text-red-600 px-2 py-1">删除</button>
+              </div>
             </div>
-            {/* 操作 */}
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <button
-                onClick={() => setEditIdx(i)}
-                className="text-xs text-blue-500 hover:text-blue-700 px-2.5 py-1 rounded border border-blue-100 hover:border-blue-300 transition-colors"
-              >
-                详情 / 编辑
-              </button>
-              <button
-                onClick={() => remove(i)}
-                className="text-xs text-red-400 hover:text-red-600 px-2 py-1"
-              >
-                删除
-              </button>
-            </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
 
       <button onClick={add}
         className="w-full border-2 border-dashed border-gray-200 text-gray-400 hover:border-blue-300 hover:text-blue-500 rounded-xl py-3 text-sm transition-colors">
         + 手动添加 Outlook 账户
       </button>
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
 
-      {/* 批量导入拟态框 */}
       {showImport && (
-        <OutlookImportModal
-          onImport={handleImport}
-          onClose={() => { setShowImport(false); load() }}
-        />
+        <OutlookImportModal onImport={handleImport} onClose={() => { setShowImport(false); load() }} />
       )}
-
-      {/* 账户编辑拟态框 */}
       {editIdx !== null && accounts[editIdx] && (
         <OutlookEditModal
           account={accounts[editIdx]}
@@ -904,10 +1065,11 @@ const TIMEOUT_LABELS = {
 
 function TabTimeouts() {
   const [data, setData] = useState({})
-  const { saving, saved, error, run } = useSave()
+  const { run, registerSave } = useSave()
   useEffect(() => { api.getSection('timeouts').then(setData).catch(() => {}) }, [])
   const set  = (k, v) => setData(d => ({ ...d, [k]: v }))
-  const save = () => run(() => api.saveSection('timeouts', data))
+  const save = useCallback(() => run(() => api.saveSection('timeouts', data)), [run, data])
+  useEffect(() => { registerSave(save) }, [save, registerSave])
   return (
     <div className="space-y-4">
       <Section title="超时配置（单位：秒）">
@@ -917,7 +1079,6 @@ function TabTimeouts() {
           </Field>
         ))}
       </Section>
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </div>
   )
 }
@@ -931,7 +1092,7 @@ function TabAdvanced() {
   const [reg,    setReg]    = useState({ prefix: '', domain: '' })
   const [team,   setTeam]   = useState({ url: '', key: '' })
   const [sync,   setSync]   = useState({ url: '', key: '' })
-  const { saving, saved, error, run } = useSave()
+  const { run, registerSave } = useSave()
 
   useEffect(() => {
     Promise.all([
@@ -944,7 +1105,7 @@ function TabAdvanced() {
     ]).catch(() => {})
   }, [])
 
-  const save = () => run(async () => {
+  const save = useCallback(() => run(async () => {
     await Promise.all([
       api.saveSection('mouse', mouse),
       api.saveSection('timing', timing),
@@ -953,7 +1114,9 @@ function TabAdvanced() {
       api.saveSection('team', team),
       api.saveSection('sync', sync),
     ])
-  })
+  }), [run, mouse, timing, oauth, reg, team, sync])
+
+  useEffect(() => { registerSave(save) }, [save, registerSave])
 
   return (
     <div className="space-y-4">
@@ -998,7 +1161,6 @@ function TabAdvanced() {
         <Field label="Sync URL"><Input value={sync.url ?? ''} onChange={e => setSync(d => ({ ...d, url: e.target.value }))} placeholder="https://..." /></Field>
         <Field label="Sync Key"><Input type="password" value={sync.key ?? ''} onChange={e => setSync(d => ({ ...d, key: e.target.value }))} /></Field>
       </Section>
-      <SaveBtn onClick={save} saving={saving} saved={saved} error={error} />
     </div>
   )
 }
@@ -1014,32 +1176,83 @@ const TABS = [
   { key: 'advanced',  label: '🔧 高级设置' },
 ]
 
+// Mail tab has per-section save buttons, so no global save button shown
+const TABS_WITH_GLOBAL_SAVE = new Set(['general', 'imap', 'outlook', 'timeouts', 'advanced'])
+
 export function Settings() {
   const [tab, setTab] = useState('general')
+  const [ctxState, setCtxState] = useState({ saving: false, saved: false, error: '' })
+  const saveRef = useRef(null)
+
+  // Stable context value — tabs register their save function here
+  const ctxValue = useMemo(() => ({
+    onState: setCtxState,
+    registerSave: (fn) => { saveRef.current = fn },
+  }), [])
+
+  const handleTabChange = (key) => {
+    setTab(key)
+    saveRef.current = null
+    setCtxState({ saving: false, saved: false, error: '' })
+  }
+
+  const showSaveBtn = TABS_WITH_GLOBAL_SAVE.has(tab)
+
   return (
-    <div className="p-6 space-y-5">
+    <SaveCtx.Provider value={ctxValue}>
       <div>
-        <h2 className="text-xl font-bold text-gray-800">配置管理</h2>
-        <p className="text-sm text-gray-500 mt-0.5">通用配置保存至 config.yaml，其余设置存入数据库</p>
+        {/* ── Sticky header: title + save button + tabs ── */}
+        <div className="sticky top-0 z-20 bg-gray-50/95 backdrop-blur-sm border-b border-gray-200 px-6 pt-4 pb-0">
+          <div className="flex items-start justify-between gap-4 mb-3">
+            <div>
+              <h2 className="text-xl font-bold text-gray-800">配置管理</h2>
+              <p className="text-sm text-gray-500 mt-0.5">通用配置保存至 config.yaml，其余设置存入数据库</p>
+            </div>
+            <div className="flex items-center gap-3 pt-1 flex-shrink-0">
+              {showSaveBtn ? (
+                <>
+                  <button
+                    onClick={() => saveRef.current?.()}
+                    disabled={ctxState.saving}
+                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors shadow-sm"
+                  >
+                    {ctxState.saving && <Spinner />}
+                    {ctxState.saving ? '保存中…' : '保存'}
+                  </button>
+                  {ctxState.saved && <span className="text-sm text-green-600 font-medium">✓ 已保存</span>}
+                  {ctxState.error && <span className="text-sm text-red-500 max-w-[200px] truncate">{ctxState.error}</span>}
+                </>
+              ) : (
+                <span className="text-xs text-gray-400 italic">各服务商单独保存</span>
+              )}
+            </div>
+          </div>
+
+          {/* Tab bar */}
+          <div className="flex gap-1 flex-wrap">
+            {TABS.map(t => (
+              <button key={t.key} onClick={() => handleTabChange(t.key)}
+                className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${
+                  tab === t.key
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                }`}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Tab content */}
+        <div className="p-6 space-y-5">
+          {tab === 'general'  && <TabGeneral />}
+          {tab === 'mail'     && <TabMail />}
+          {tab === 'imap'     && <TabImap />}
+          {tab === 'outlook'  && <TabOutlook />}
+          {tab === 'timeouts' && <TabTimeouts />}
+          {tab === 'advanced' && <TabAdvanced />}
+        </div>
       </div>
-      <div className="flex gap-1 border-b border-gray-200 flex-wrap">
-        {TABS.map(t => (
-          <button key={t.key} onClick={() => setTab(t.key)}
-            className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${
-              tab === t.key ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-            }`}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-      <div>
-        {tab === 'general'  && <TabGeneral />}
-        {tab === 'mail'     && <TabMail />}
-        {tab === 'imap'     && <TabImap />}
-        {tab === 'outlook'  && <TabOutlook />}
-        {tab === 'timeouts' && <TabTimeouts />}
-        {tab === 'advanced' && <TabAdvanced />}
-      </div>
-    </div>
+    </SaveCtx.Provider>
   )
 }

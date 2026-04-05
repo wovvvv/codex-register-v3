@@ -115,14 +115,27 @@ async def _run_job(job: _Job) -> None:
 
         def _get_mail_client(n: int):
             if _is_imap_provider:
-                provider_idx = int(job.provider.split(":")[1])
+                _parts = job.provider.split(":")
+                provider_idx = int(_parts[1])
                 if provider_idx >= len(imap_raw):
                     raise ValueError(f"IMAP 服务商索引 {provider_idx} 不存在（共 {len(imap_raw)} 个）")
                 prov     = imap_raw[provider_idx]
                 accounts = prov.get("accounts", [])
                 if not accounts:
                     raise ValueError(f"IMAP 服务商 {provider_idx} ({prov.get('name','?')}) 没有配置账户")
-                acc       = accounts[(n - 1) % len(accounts)]
+
+                # imap:N:M → fixed account M within provider N; imap:N → rotate
+                if len(_parts) >= 3 and _parts[2].isdigit():
+                    acc_idx = int(_parts[2])
+                    if acc_idx >= len(accounts):
+                        raise ValueError(
+                            f"IMAP 服务商 {provider_idx} 账户索引 {acc_idx} 不存在"
+                            f"（共 {len(accounts)} 个账户）"
+                        )
+                    acc = accounts[acc_idx]
+                else:
+                    acc = accounts[(n - 1) % len(accounts)]
+
                 auth_type = prov.get("auth_type", "password")
                 cred      = acc.get("credential", "")
                 return IMAPMailClient(
@@ -139,7 +152,19 @@ async def _run_job(job: _Job) -> None:
             elif _is_outlook:
                 if not out_raw:
                     raise ValueError("没有配置 Outlook 账户")
-                acc = out_raw[(n - 1) % len(out_raw)]
+
+                # outlook:N → fixed account N; outlook → rotate through all
+                _parts = job.provider.lower().split(":")
+                if len(_parts) >= 2 and _parts[1].isdigit():
+                    out_idx = int(_parts[1])
+                    if out_idx >= len(out_raw):
+                        raise ValueError(
+                            f"Outlook 账户索引 {out_idx} 不存在（共 {len(out_raw)} 个）"
+                        )
+                    acc = out_raw[out_idx]
+                else:
+                    acc = out_raw[(n - 1) % len(out_raw)]
+
                 return OutlookMailClient(
                     email         = acc.get("email", ""),
                     client_id     = acc.get("client_id", ""),
@@ -443,6 +468,28 @@ async def api_accounts(status: str = "", limit: int = 200, offset: int = 0):
     return {"total": len(rows), "items": rows[offset: offset + limit]}
 
 
+@app.delete("/api/accounts/{email:path}")
+async def api_delete_account(email: str):
+    """Delete a single account by email."""
+    await accounts_mod.delete(urllib.parse.unquote(email))
+    return {"ok": True}
+
+
+@app.post("/api/accounts/batch-delete")
+async def api_batch_delete_accounts(request: Request):
+    """Batch delete accounts. Pass {emails:[...]} or {select_all:true, status:'...'}."""
+    body = await request.json()
+    emails: list = body.get("emails", [])
+    select_all: bool = body.get("select_all", False)
+    status_filter: str = body.get("status", "")
+    if select_all:
+        rows = await accounts_mod.list_all(status_filter or None)
+        emails = [r["email"] for r in rows]
+    for email in emails:
+        await accounts_mod.delete(email)
+    return {"deleted": len(emails)}
+
+
 @app.get("/api/accounts/stats")
 async def api_account_stats():
     rows = await accounts_mod.list_all()
@@ -527,6 +574,34 @@ async def api_cancel_job(job_id: str):
     return {"ok": True}
 
 
+@app.post("/api/jobs/batch-action")
+async def api_batch_jobs_action(request: Request):
+    """Batch cancel or delete jobs. Pass {action:'cancel'|'delete', ids:[...], select_all:bool}."""
+    body = await request.json()
+    action: str = body.get("action", "delete")
+    ids: list = body.get("ids", [])
+    select_all: bool = body.get("select_all", False)
+    if select_all:
+        ids = list(_jobs.keys())
+    count = 0
+    for job_id in ids:
+        if action == "cancel":
+            job = _jobs.get(job_id)
+            if job and job.status == "running":
+                job.status = "cancelled"
+                if job.task and not job.task.done():
+                    job.task.cancel()
+                job.log("⛔ 用户批量取消")
+                count += 1
+        else:  # delete
+            job = _jobs.pop(job_id, None)
+            if job:
+                if job.task and not job.task.done():
+                    job.task.cancel()
+                count += 1
+    return {"affected": count}
+
+
 # ── Proxies API ───────────────────────────────────────────────────────────
 
 @app.get("/api/proxies")
@@ -548,6 +623,20 @@ async def api_add_proxy(request: Request):
 async def api_delete_proxy(address: str):
     await proxy_pool_mod.remove(urllib.parse.unquote(address))
     return {"ok": True}
+
+
+@app.post("/api/proxies/batch-delete")
+async def api_batch_delete_proxies(request: Request):
+    """Batch delete proxies. Pass {addresses:[...]} or {select_all:true}."""
+    body = await request.json()
+    addresses: list = body.get("addresses", [])
+    select_all: bool = body.get("select_all", False)
+    if select_all:
+        all_proxies = await proxy_pool_mod.list_all()
+        addresses = [p["address"] for p in all_proxies]
+    for addr in addresses:
+        await proxy_pool_mod.remove(addr)
+    return {"deleted": len(addresses)}
 
 
 # ── SPA ───────────────────────────────────────────────────────────────────

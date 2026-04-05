@@ -563,17 +563,52 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int, mobi
     # humanize=True: built-in human-like timing for mouse events (helps vs bot-detect)
     # block_webrtc=True: prevent WebRTC from leaking local IP through proxy
     # window expects (width, height) tuple, NOT a dict
-    async with AsyncCamoufox(
-        headless=headless,
-        proxy=proxy_cfg,
-        os=os_choice,
-        locale="en-US",
-        block_webrtc=True,
-        humanize=True,
-        window=win_size,          # (width, height) tuple
-        geoip=proxy_cfg is not None,
-        **extra_kwargs,
-    ) as browser:
+    #
+    # BrowserForge OS fallback: some OS/window-size combinations have too few
+    # fingerprints in the dataset and raise
+    #   "No headers based on this input can be generated."
+    # We retry with alternative OS values before giving up.
+    _os_fallback = [os_choice] + [o for o in ("linux", "macos", "windows") if o != os_choice]
+
+    cam_cm = None
+    browser = None
+    for _os_try in _os_fallback:
+        try:
+            cam_cm = AsyncCamoufox(
+                headless=headless,
+                proxy=proxy_cfg,
+                os=_os_try,
+                locale="en-US",
+                block_webrtc=True,
+                humanize=True,
+                window=win_size,          # (width, height) tuple
+                geoip=proxy_cfg is not None,
+                **extra_kwargs,
+            )
+            browser = await cam_cm.__aenter__()
+            if _os_try != os_choice:
+                logger.info(f"[engine] Camoufox: fell back to OS={_os_try!r} (BrowserForge rejected {os_choice!r})")
+            break
+        except Exception as _bf_exc:
+            _msg = str(_bf_exc).lower()
+            if "no headers" in _msg or "requirements you specified" in _msg or "relax" in _msg:
+                logger.warning(
+                    f"[engine] Camoufox OS={_os_try!r} BrowserForge rejection — "
+                    f"trying next OS… ({_bf_exc})"
+                )
+                cam_cm = None
+                continue
+            raise
+
+    if browser is None or cam_cm is None:
+        raise RuntimeError(
+            "Camoufox: BrowserForge could not generate HTTP headers for any OS "
+            f"(tried: {_os_fallback}). Try updating camoufox/browserforge: "
+            "`uv run python -m camoufox fetch`"
+        )
+
+    page = None
+    try:
         page = await browser.new_page()
         if slow_mo > 0:
             # camoufox doesn't expose slow_mo natively; approximate via monkey-patch
@@ -584,10 +619,17 @@ async def _camoufox_page(proxy_cfg, viewport, headless: bool, slow_mo: int, mobi
                 return await _orig_click(*a, **kw)
 
             page.click = _slow_click  # type: ignore[method-assign]
+        yield page
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
         try:
-            yield page
-        finally:
-            await page.close()
+            await cam_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
 
 
 @asynccontextmanager

@@ -172,6 +172,14 @@ class FatalRegistrationError(Exception):
     """Raised when registration cannot be retried (e.g. email creation failed)."""
 
 
+class SkipRegistrationError(FatalRegistrationError):
+    """Raised when OTP verification page appears instead of password — skip this email."""
+
+
+class EmailAlreadyRegisteredError(FatalRegistrationError):
+    """Raised when Auth0 redirects to /log-in/password — email already has an account."""
+
+
 # ── Network-safe navigation ────────────────────────────────────────────────
 
 async def _safe_goto(
@@ -206,6 +214,7 @@ async def register_one(
     cfg: dict,
     mail_client: MailClient,
     proxy: Optional[str] = None,
+    log_fn=None,
 ) -> dict:
     """
     Run a single end-to-end ChatGPT registration mirroring tool.js flow.
@@ -246,6 +255,8 @@ async def register_one(
                 timeouts[new_k] = _legacy[old_k]
 
     logger.info(f"[{task_id}] Creating e-mail via {cfg.get('mail_provider', 'gptmail')}")
+    if log_fn:
+        log_fn("步骤 1/7: 申请注册邮箱…")
     try:
         email = await mail_client.generate_email(prefix=prefix, domain=domain)
     except Exception as exc:
@@ -268,7 +279,9 @@ async def register_one(
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info(f"[{task_id}] Attempt {attempt}/{MAX_RETRIES} — {email}")
-                await _state_machine(task_id, page, account, mail_client, timeouts)
+                if log_fn:
+                    log_fn(f"步骤 2/7: 尝试注册 {attempt}/{MAX_RETRIES}，邮箱: {email}")
+                await _state_machine(task_id, page, account, mail_client, timeouts, log_fn=log_fn)
                 account["status"] = "注册完成"
                 logger.success(f"[{task_id}] ✅ Done: {email}")
 
@@ -312,6 +325,22 @@ async def register_one(
 
                 return account
 
+            except EmailAlreadyRegisteredError as exc:
+                logger.warning(f"[{task_id}] ⚠️ 邮箱已注册，跳过: {account['email']}")
+                if log_fn:
+                    log_fn(f"⚠️ 跳过：该邮箱已注册 ({account['email']})")
+                account["status"] = "already_registered"
+                account["error"] = str(exc)
+                return account
+
+            # except SkipRegistrationError as exc:
+            #     logger.warning(f"[{task_id}] Skipped (OTP detected): {exc}")
+            #     if log_fn:
+            #         log_fn(f"⚠️ 跳过：检测到 OTP 验证登录，无密码注册流程 ({email})")
+            #     account["status"] = "skipped_otp_verify"
+            #     account["error"] = str(exc)
+            #     return account
+
             except RegistrationError as exc:
                 logger.warning(f"[{task_id}] Retry {attempt}/{MAX_RETRIES}: {exc}")
                 if attempt < MAX_RETRIES:
@@ -354,16 +383,21 @@ async def _state_machine(
     account: dict,
     mail_client: MailClient,
     timeouts: dict,
+    log_fn=None,
 ) -> None:
     """
     Sequentially executes the 7-state flow matching tool.js _0x548_inner:
       GOTO_SIGNUP → FILL_EMAIL → FILL_PASSWORD → WAIT_CODE → FILL_CODE → FILL_PROFILE → COMPLETE
     """
+    def _step(n: int, msg: str) -> None:
+        logger.info(f"[{task_id}] [{n}/7] {msg}")
+        if log_fn:
+            log_fn(f"步骤 {n}/7: {msg}")
 
     # ── STATE: GOTO_SIGNUP ────────────────────────────────────────────
     # tool.js: window.location.href = 'https://chatgpt.com/auth/login'
     # NextAuth 302-redirects → auth.openai.com Universal Login
-    logger.info(f"[{task_id}] GOTO_SIGNUP → {LOGIN_URL}")
+    _step(1, f"导航到注册入口 {LOGIN_URL}")
     await _safe_goto(task_id, page, LOGIN_URL,
                      timeout_ms=int(timeouts.get("page_load", 60) * 1000))
 
@@ -390,9 +424,8 @@ async def _state_machine(
         await jitter_sleep(0.5, 0.2)
     else:
         # Find and click the "Sign Up" button
-        # tool.js: querySelector('a[href*="signup"], [data-testid="signup-link"]')
-        #          then text-match /^(sign up|sign up for free|免费注册|create account)$/i
         logger.info(f"[{task_id}] Looking for Sign Up button — URL={page.url}")
+        _step(2, "查找并点击「注册」入口")
         signup_btn = await find_signup_button(task_id, page)
 
         if not signup_btn:
@@ -416,6 +449,7 @@ async def _state_machine(
 
     # ── STATE: FILL_EMAIL ─────────────────────────────────────────────
     # tool.js: _0x1bf(email_selectors, 0x3a98) — wait up to 15 s
+    _step(3, f"填写邮箱 {account['email']}")
     logger.info(f"[{task_id}] FILL_EMAIL — URL={page.url}")
     email_result = await wait_any_element(
         page, _EMAIL_SELECTORS,
@@ -462,16 +496,34 @@ async def _state_machine(
     logger.debug(f"[{task_id}] Email submitted")
 
     # ── STATE: FILL_PASSWORD ──────────────────────────────────────────
-    # tool.js: _0x98d(d) — polls up to 60 s for password input
-    logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password input (≤{timeouts.get('password_input', 60)} s)")
-    pw_result = await wait_any_element(
-        page, _PASSWORD_SELECTORS,
-        timeout_ms=int(timeouts.get("password_input", 60) * 1000),
+    # After email submit, detect if page shows password input OR OTP verification.
+    # If OTP appears (no password form) → skip this email (non-retryable).
+    _step(4, "等待密码输入框（检测是否需要 OTP 验证）")
+    logger.info(f"[{task_id}] FILL_PASSWORD — waiting for password or OTP (≤{timeouts.get('password_input', 60)} s)")
+
+    detected = await _wait_for_password_or_otp(
+        page, timeout_ms=int(timeouts.get("password_input", 60) * 1000),
     )
-    if not pw_result:
+
+    if detected == "already_registered":
+        raise EmailAlreadyRegisteredError(
+            f"邮箱 {account['email']} 已注册（Auth0 跳转至登录密码页 /log-in/password）"
+        )
+    elif detected == "otp":
+        raise SkipRegistrationError(
+            f"OTP 验证页面出现（非密码注册流程），跳过此邮箱. URL={page.url}"
+        )
+    elif detected == "none":
         raise RegistrationError(
             f"Password input not found after email submit. URL={page.url}"
         )
+
+    # detected == "password"
+    pw_result = await wait_any_element(
+        page, _PASSWORD_SELECTORS, timeout_ms=3000,
+    )
+    if not pw_result:
+        raise RegistrationError(f"Password input not found (post-detect). URL={page.url}")
     await _assert_not_error(task_id, page)
 
     matched_pw_sel, pw_el = pw_result
@@ -510,6 +562,7 @@ async def _state_machine(
     # ── STATE: WAIT_CODE ──────────────────────────────────────────────
     # tool.js: _0x98d wait loop — checks for input[maxlength="1"] or
     # autocomplete="one-time-code" every 1 s, up to 60 s
+    _step(5, f"等待验证码邮件（轮询收件箱，超时 {timeouts.get('otp_code', 180)}s）")
     logger.info(f"[{task_id}] WAIT_CODE — waiting for OTP inputs (≤{timeouts.get('otp_input', 60)} s)")
     otp_appeared = await _wait_for_otp_inputs(
         page, timeout_ms=int(timeouts.get("otp_input", 60) * 1000),
@@ -531,6 +584,7 @@ async def _state_machine(
         raise RegistrationError("OTP code not received within timeout")
 
     logger.info(f"[{task_id}] FILL_CODE → {code}")
+    _step(6, f"填写验证码 {code}")
 
     # ── STATE: FILL_CODE ──────────────────────────────────────────────
     # tool.js: _0xbaf(c, d) — fill individual digit boxes or single field
@@ -573,6 +627,7 @@ async def _state_machine(
         )
 
     if fname_result or name_only_result or on_about_you:
+        _step(7, "填写姓名和生日信息")
         logger.info(f"[{task_id}] FILL_PROFILE — URL={page.url}")
         await _fill_profile(task_id, page, account, timeouts)
     else:
@@ -598,6 +653,70 @@ async def _state_machine(
 
 
 # ── Sub-routines ───────────────────────────────────────────────────────────
+
+async def _wait_for_password_or_otp(page: Page, timeout_ms: int = 60_000) -> str:
+    """
+    After email submit, race between password input and OTP input.
+
+    Returns:
+        "password"          — normal password registration flow
+        "otp"               — OTP/magic-link verification page (no password)
+        "already_registered"— Auth0 redirected to /log-in/password (existing account)
+        "none"              — neither appeared within timeout
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
+
+    _otp_check_selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[name='code']",
+        "input[id*='code']",
+    ]
+
+    while asyncio.get_event_loop().time() < deadline:
+        url = page.url.lower()
+
+        # ── Detect already-registered: Auth0 login flow URL ──────────
+        # When email is already registered, Auth0 redirects to the *login*
+        # password page (/log-in/password) instead of the *signup* flow.
+        # This must be checked BEFORE the password-selector check because
+        # the login page also contains a password <input>.
+        if "/log-in/password" in url:
+            return "already_registered"
+
+        # Check for password input first
+        for sel in _PASSWORD_SELECTORS:
+            try:
+                if await is_visible(page, sel):
+                    return "password"
+            except Exception:
+                pass
+
+        # Check for OTP digit boxes (≥4 means OTP page)
+        try:
+            count = await page.locator(
+                "input[type='text'][maxlength='1'], input[maxlength='1']"
+            ).count()
+            if count >= 4:
+                return "otp"
+        except Exception:
+            pass
+
+        # Check for single OTP field
+        for sel in _otp_check_selectors:
+            try:
+                if await is_visible(page, sel):
+                    return "otp"
+            except Exception:
+                pass
+
+        # Check URL pattern for magic link / email verification login
+        if any(kw in url for kw in ("magic", "email-link", "email-verify", "check-email")):
+            return "otp"
+
+        await asyncio.sleep(0.5)
+
+    return "none"
+
 
 async def _assert_not_error(task_id: str, page: Page) -> None:
     """

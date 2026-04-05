@@ -206,6 +206,106 @@ mail:
 | Gmail | 账户安全 → 应用专用密码（生成 16 位密码）；Gmail 设置 → IMAP → 启用 |
 | QQ 邮箱 | 设置 → 账户 → IMAP/SMTP 服务 → 开启，获取授权码 |
 
+### Outlook / Hotmail（Microsoft OAuth2）
+
+使用 Outlook、Hotmail 或 Live 邮箱通过 Microsoft Graph API 或 IMAP XOAUTH2 收取验证码。需要在 Azure AD 注册一个应用，并预先完成 OAuth2 设备码授权流程获得 `refresh_token`。
+
+#### 前置步骤：在 Azure AD 注册应用
+
+1. 登录 [Azure 门户](https://portal.azure.com) → **Microsoft Entra ID（Azure AD）** → **应用注册** → **新注册**。
+2. **受支持的账户类型** 选 _个人 Microsoft 账户（仅 outlook.com / hotmail.com）_，填入任意名称。
+3. **重定向 URI** 选 _公共客户端/本机_ → 填入：
+   ```
+   https://login.microsoftonline.com/common/oauth2/nativeclient
+   ```
+4. 注册完成后，在 **概览** 页面复制 **应用程序（客户端）ID**（即 `client_id`）。
+5. 进入 **API 权限** → **添加权限** → **Microsoft Graph** → **委托权限**，添加：
+   - `Mail.Read`（Graph 收信模式，推荐）
+   - `offline_access`（允许刷新 Token）
+   - 若使用 IMAP 模式，改为添加 `IMAP.AccessAsUser.All` + `offline_access`
+6. 进入 **身份验证** → 底部勾选 **允许公共客户端流**（_Enable the following mobile and desktop flows_）。
+
+#### 获取 refresh_token（一次性操作）
+
+**推荐方法：设备码流**
+
+```powershell
+# Graph 模式（推荐）
+$clientId = "你的 client_id"
+$scope    = "https://graph.microsoft.com/Mail.Read offline_access"
+
+# 1. 发起设备码请求
+$resp = Invoke-RestMethod -Method Post `
+  -Uri "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode" `
+  -Body @{ client_id=$clientId; scope=$scope }
+
+# 2. 按提示在浏览器中打开链接并登录
+Write-Host $resp.message
+
+# 3. 轮询获取 Token（登录完成后执行）
+$token = Invoke-RestMethod -Method Post `
+  -Uri "https://login.microsoftonline.com/consumers/oauth2/v2.0/token" `
+  -Body @{
+    client_id=$clientId; grant_type="urn:ietf:params:oauth:grant-type:device_code"
+    device_code=$resp.device_code
+  }
+
+Write-Host "refresh_token:" $token.refresh_token
+```
+
+> 也可以使用 [msal-python](https://github.com/AzureAD/microsoft-authentication-library-for-python) 等工具完成设备码流程，或在 Web UI 中通过 **Settings → Outlook/Hotmail → 添加账户** 界面完成。
+
+#### 配置 config.yaml
+
+```yaml
+mail_provider: outlook    # 多账户时轮询；hotmail 与 outlook 等价
+# mail_provider: outlook:0  # 固定使用第 0 个账户
+# mail_provider: outlook:1  # 固定使用第 1 个账户
+
+mail:
+  outlook:
+    - email:         "yourname@outlook.com"   # 完整邮箱地址
+      client_id:     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Azure 应用 ID
+      tenant_id:     "consumers"              # 个人账户固定填 consumers
+      refresh_token: "0.AXXXXXXXXXXXXX..."    # 上一步获取的 refresh_token
+      fetch_method:  "graph"                  # graph（推荐）或 imap
+    # 第二个账户（可选，多账户轮询）:
+    # - email:         "another@hotmail.com"
+    #   client_id:     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    #   tenant_id:     "consumers"
+    #   refresh_token: "0.BXXXXXXXXXXXXX..."
+    #   fetch_method:  "graph"
+```
+
+> `fetch_method` 说明：
+> - `graph`（默认）：通过 Microsoft Graph REST API 收信，**无需开启 IMAP**，推荐使用。
+> - `imap`：通过 IMAP XOAUTH2 收信，需在 Azure 权限中添加 `IMAP.AccessAsUser.All`。
+
+#### CLI 启动注册
+
+```powershell
+# 切换邮件服务为 outlook 并注册 3 个账号
+uv run python -m src.main config set mail_provider outlook
+uv run python -m src.main register --count 3
+
+# 或者直接用 --provider 参数（不改配置文件）
+uv run python -m src.main register --count 3 --provider outlook
+
+# 固定使用第 0 个 Outlook 账户注册
+uv run python -m src.main register --count 5 --provider outlook:0
+
+# 搭配代理注册
+uv run python -m src.main register --count 3 --provider outlook --proxy "http://user:pass@host:port"
+
+# 有头调试模式（可在浏览器窗口观察注册过程）
+uv run python -m src.main register --count 1 --provider outlook --headed
+```
+
+**注意事项：**
+- Outlook 账号直接用于注册（邮箱地址即被注册的 ChatGPT 账号），不支持 `+alias` 别名模式；多账户并发时每个浏览器任务使用不同的 Outlook 账号。
+- `access_token` 由程序自动管理（约 1 小时有效期），无需手动填写；`refresh_token` 长期有效，只要不撤销授权即可一直使用。
+- 若报错 `No refresh_token configured`，说明该账户的 `refresh_token` 为空，需重新完成设备码授权流程。
+
 ---
 
 ## CLI 命令

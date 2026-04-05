@@ -143,7 +143,8 @@ class OutlookMailClient(MailClient):
             f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token"
         )
 
-        async with httpx.AsyncClient(timeout=30) as c:
+        # trust_env=False: 不读取 Windows 系统代理（避免代理拦截导致的 SSL 错误）
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as c:
             r = await c.post(token_url, data={
                 "client_id":     self._client_id,
                 "grant_type":    "refresh_token",
@@ -190,7 +191,7 @@ class OutlookMailClient(MailClient):
         while time.monotonic() < deadline:
             try:
                 token = await self._get_token()
-                async with httpx.AsyncClient(timeout=30) as c:
+                async with httpx.AsyncClient(timeout=30, trust_env=False) as c:
                     r = await c.get(
                         _GRAPH_MESSAGES_URL,
                         headers={"Authorization": f"Bearer {token}"},
@@ -243,9 +244,10 @@ class OutlookMailClient(MailClient):
 
                 imap = aioimaplib.IMAP4_SSL(host=_IMAP_HOST, port=_IMAP_PORT, timeout=15)
                 await imap.wait_hello_from_server()
-                ok, _ = await imap.authenticate("XOAUTH2", lambda x: xoauth2.encode())
-                if ok != "OK":
-                    logger.warning(f"[Outlook/IMAP] Auth failed: {ok}")
+                # aioimaplib.xoauth2(user, raw_access_token) 内部自建 XOAUTH2 SASL 字符串
+                resp = await imap.xoauth2(self._email, token)
+                if resp.result != "OK":
+                    logger.warning(f"[Outlook/IMAP] Auth failed: {resp.result} {resp.lines}")
                     await asyncio.sleep(5)
                     continue
 
@@ -254,7 +256,7 @@ class OutlookMailClient(MailClient):
                     await asyncio.sleep(5)
                     continue
 
-                ok, data = await imap.search("UNSEEN")
+                ok, data = await imap.search("UNSEEN", charset=None)
                 if ok != "OK":
                     await asyncio.sleep(4)
                     continue
@@ -295,9 +297,12 @@ class OutlookMailClient(MailClient):
             except asyncio.TimeoutError:
                 logger.warning("[Outlook/IMAP] Timeout — retrying")
             except OSError as exc:
-                logger.warning(f"[Outlook/IMAP] Network error: {exc}")
+                logger.warning(f"[Outlook/IMAP] Network error [{type(exc).__name__}]: {exc!r}")
             except Exception as exc:
-                logger.warning(f"[Outlook/IMAP] Error: {exc}")
+                logger.warning(
+                    f"[Outlook/IMAP] Error [{type(exc).__name__}]: {exc!r} | "
+                    f"args={exc.args!r}"
+                )
             finally:
                 if imap is not None:
                     try:

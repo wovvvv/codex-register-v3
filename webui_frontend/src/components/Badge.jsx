@@ -22,7 +22,9 @@ const STATUS_MAP = {
   running:                 { color: 'blue',   label: '⟳ 运行中' },
   done:                    { color: 'green',  label: '✓ 完成' },
   error:                   { color: 'red',    label: '✗ 错误' },
+  cancelled:               { color: 'orange', label: '⛔ 已取消' },
   email_creation_failed:   { color: 'orange', label: '✗ 邮件失败' },
+  skipped_otp_verify:      { color: 'yellow', label: '⚠ OTP跳过' },
   imported:                { color: 'purple', label: '导入' },
 }
 
