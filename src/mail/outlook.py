@@ -151,6 +151,80 @@ class OutlookMailClient(MailClient):
 
     # ── Token management ──────────────────────────────────────────────────
 
+    def _refresh_token_sync(self) -> dict:
+        """
+        Synchronous token refresh using stdlib urllib.request.
+
+        We intentionally do NOT route through self._proxy here.
+        Diagnosis shows that login.microsoftonline.com is reachable directly
+        (HTTP 200), but going through the HTTP proxy (e.g. Clash on port 10810)
+        causes an SSLEOFError during the TLS handshake because the proxy applies
+        TLS interception rules to port 443.  The proxy is only used for the IMAP
+        tunnel (port 993) where it works correctly via HTTP CONNECT.
+
+        Fallback: if direct attempt fails (e.g. endpoint is network-blocked),
+        we retry once through the configured proxy.
+        """
+        import json as _json
+        import ssl as _ssl
+        import urllib.parse as _urlparse
+        import urllib.request as _urlreq
+
+        scope     = _SCOPE_GRAPH if self._fetch_method == "graph" else _SCOPE_IMAP
+        token_url = (
+            f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token"
+        )
+        payload = _urlparse.urlencode({
+            "client_id":     self._client_id,
+            "grant_type":    "refresh_token",
+            "refresh_token": self._refresh_token,
+            "scope":         scope,
+        }).encode()
+
+        req = _urlreq.Request(
+            token_url,
+            data    = payload,
+            headers = {"Content-Type": "application/x-www-form-urlencoded"},
+            method  = "POST",
+        )
+
+        def _fetch(opener) -> dict:
+            with opener.open(req, timeout=25) as resp:
+                data = _json.loads(resp.read())
+            if "access_token" not in data:
+                raise RuntimeError(
+                    f"Token endpoint returned no access_token: {data}"
+                )
+            return data
+
+        # ── Try direct first (bypass system/env proxy) ───────────────────
+        # login.microsoftonline.com is reachable without a proxy.
+        # ProxyHandler({}) explicitly disables system proxy so urllib doesn't
+        # pick up the Windows registry proxy (e.g. Clash's auto-set system proxy)
+        # which would break TLS for port 443.
+        try:
+            no_proxy_opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+            return _fetch(no_proxy_opener)
+        except Exception as direct_exc:
+            logger.debug(
+                f"[Outlook] Direct token fetch failed ({type(direct_exc).__name__}: "
+                f"{direct_exc!r}), retrying via proxy…"
+            )
+
+        # ── Fallback: try via proxy ───────────────────────────────────────
+        if self._proxy:
+            ssl_ctx = _ssl.create_default_context()
+            opener  = _urlreq.build_opener(
+                _urlreq.ProxyHandler({"http": self._proxy, "https": self._proxy}),
+                _urlreq.HTTPSHandler(context=ssl_ctx),
+            )
+            return _fetch(opener)
+
+        raise RuntimeError(
+            f"[Outlook] Token refresh failed for {self._email} "
+            f"(direct error: {direct_exc!r}; no proxy configured)"
+        )
+
     async def _get_token(self) -> str:
         """Return a valid access_token, refreshing if needed."""
         if self._access_token and time.time() < self._token_expiry - 60:
@@ -162,20 +236,7 @@ class OutlookMailClient(MailClient):
                 "Complete the OAuth2 device-code flow first."
             )
 
-        scope = _SCOPE_GRAPH if self._fetch_method == "graph" else _SCOPE_IMAP
-        token_url = (
-            f"https://login.microsoftonline.com/{self._tenant_id}/oauth2/v2.0/token"
-        )
-
-        async with self._httpx_client() as c:
-            r = await c.post(token_url, data={
-                "client_id":     self._client_id,
-                "grant_type":    "refresh_token",
-                "refresh_token": self._refresh_token,
-                "scope":         scope,
-            })
-            r.raise_for_status()
-            data = r.json()
+        data = await asyncio.to_thread(self._refresh_token_sync)
 
         self._access_token = data["access_token"]
         self._token_expiry = time.time() + data.get("expires_in", 3600)
@@ -206,59 +267,76 @@ class OutlookMailClient(MailClient):
     # ── Graph API fetch ───────────────────────────────────────────────────
 
     async def _poll_graph(self, timeout: int) -> Optional[str]:
+        import json as _json
+        import urllib.request as _urlreq
+        import ssl as _ssl
+
         deadline  = time.monotonic() + timeout
         seen_ids: set[str] = set()
 
-        # Query both inbox and junk — OTP emails are often auto-filtered to Junk
         _GRAPH_FOLDERS = [
             (_GRAPH_MESSAGES_URL, "inbox"),
             (_GRAPH_JUNK_URL,     "junk"),
         ]
-        _PARAMS = {
-            "$select":  "id,subject,body,receivedDateTime",
-            "$filter":  "isRead eq false",
-            "$orderby": "receivedDateTime desc",
-            "$top":     "25",
-        }
+        _PARAMS = (
+            "$select=id,subject,body,receivedDateTime"
+            "&$filter=isRead eq false"
+            "&$orderby=receivedDateTime desc"
+            "&$top=25"
+        )
 
         logger.info(
             f"[Outlook/Graph] Polling inbox+junk for {self._email} (timeout={timeout}s)"
         )
 
+        def _sync_graph_fetch(access_token: str) -> Optional[str]:
+            """Synchronous Graph API fetch using urllib.
+            Always connects directly — Graph API endpoints are normally reachable
+            without a proxy, and forcing HTTPS through the proxy breaks TLS.
+            """
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            }
+            # Direct opener (no proxy, no system proxy) — ProxyHandler({}) disables
+            # Windows registry proxy so we connect to Graph API directly.
+            opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
+
+            for url, folder_label in _GRAPH_FOLDERS:
+                full_url = f"{url}?{_PARAMS}"
+                req = _urlreq.Request(full_url, headers=headers)
+                try:
+                    with opener.open(req, timeout=20) as resp:
+                        data = _json.loads(resp.read())
+                    messages = data.get("value", [])
+                except Exception as exc:
+                    logger.warning(f"[Outlook/Graph] {folder_label} error: {exc!r}")
+                    continue
+
+                for msg in messages:
+                    mid = msg.get("id", "")
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    subject = msg.get("subject", "")
+                    body    = (msg.get("body") or {}).get("content", "")
+                    code    = _extract_code(f"{subject} {body}")
+                    if code:
+                        logger.info(
+                            f"[Outlook/Graph] Code {code} for {self._email}"
+                            f" (folder={folder_label})"
+                        )
+                        return code
+            return None
+
         while time.monotonic() < deadline:
             try:
-                token   = await self._get_token()
-                headers = {"Authorization": f"Bearer {token}"}
-
-                async with self._httpx_client() as c:
-                    for url, folder_label in _GRAPH_FOLDERS:
-                        try:
-                            r = await c.get(url, headers=headers, params=_PARAMS)
-                            r.raise_for_status()
-                            messages = r.json().get("value", [])
-                        except Exception as exc:
-                            logger.warning(
-                                f"[Outlook/Graph] Error querying {folder_label}: {exc}"
-                            )
-                            continue
-
-                        for msg in messages:
-                            mid = msg.get("id", "")
-                            if mid in seen_ids:
-                                continue
-                            seen_ids.add(mid)
-                            subject = msg.get("subject", "")
-                            body    = (msg.get("body") or {}).get("content", "")
-                            code    = _extract_code(f"{subject} {body}")
-                            if code:
-                                logger.info(
-                                    f"[Outlook/Graph] Code {code} for {self._email}"
-                                    f" (folder={folder_label})"
-                                )
-                                return code
-
+                token = await self._get_token()
+                code  = await asyncio.to_thread(_sync_graph_fetch, token)
+                if code:
+                    return code
             except Exception as exc:
-                logger.warning(f"[Outlook/Graph] error: {exc}")
+                logger.warning(f"[Outlook/Graph] error [{type(exc).__name__}]: {exc!r}")
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -345,14 +423,14 @@ class OutlookMailClient(MailClient):
             ssl_sock.settimeout(30)
 
             # ── 3. Inject SSL socket into imaplib ─────────────────────────
-            # Subclass IMAP4 so open() hands back our ready SSL socket.
-            # IMAP4.__init__ calls open() then reads the server greeting.
+            # Python 3.14: IMAP4.open() calls _create_socket(timeout) to get
+            # the socket, then sets _file = sock.makefile('rb').
+            # Override _create_socket to hand back our pre-built SSL socket.
             _the_sock = ssl_sock
 
             class _PatchedIMAP4(_imaplib.IMAP4):
-                def open(self, host, port=None):   # noqa: ARG002
-                    self.sock = _the_sock
-                    self.file = self.sock.makefile("rb")
+                def _create_socket(self, timeout=None):   # noqa: ARG002
+                    return _the_sock
 
             M = _PatchedIMAP4(_IMAP_HOST)
 
