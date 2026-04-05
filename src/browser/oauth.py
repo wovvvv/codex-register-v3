@@ -164,6 +164,7 @@ async def acquire_tokens_via_browser(
     timeouts: Optional[dict] = None,
     mail_client: Optional[MailClient] = None,
     mobile: bool = False,
+    log_fn=None,
 ) -> Optional[TokenResult]:
     """
     Use the browser's existing authenticated session to perform a Codex PKCE
@@ -189,6 +190,8 @@ async def acquire_tokens_via_browser(
                         oauth_token_exchange, otp_code.
         mail_client:  Optional mail client used to poll for the email OTP when
                       Auth0 demands email verification after password login.
+        log_fn:       Optional callable(msg: str) — brief status messages are
+                      forwarded to the WebUI job log panel.
         mobile:       When True, a fresh Chromium context with a mobile
                       fingerprint (random iOS/Android UA, touch viewport, mobile
                       stealth JS) is created for the OAuth flow.  Cookies from
@@ -244,6 +247,28 @@ async def acquire_tokens_via_browser(
         await oauth_page.route("http://localhost:1455/**", _intercept)
 
         async def _run_flow() -> Optional[TokenResult]:
+            # ── URL-based code extractor (route-handler bypass guard) ────────
+            # page.route() intercepts fetch/navigation requests, but JS redirects
+            # (window.location.replace) may bypass it.  Calling this at every
+            # checkpoint ensures we never miss a code that's already visible in
+            # the page URL.
+            def _sync_capture_from_url() -> bool:
+                """Extract OAuth code from current page URL → captured.  Sync."""
+                try:
+                    cur = oauth_page.url
+                    if "code=" not in cur:
+                        return False
+                    if "localhost:1455" not in cur and OAUTH_REDIRECT_URI.split("?")[0] not in cur:
+                        return False
+                    code = _extract_code(cur)
+                    if code and code not in captured:
+                        captured.append(code)
+                        logger.info(f"[oauth] Code extracted from page URL directly: {cur[:120]}")
+                        return True
+                except Exception:
+                    pass
+                return False
+
             # Detect fingerprint mode from the page's actual User-Agent so the
             # log is accurate regardless of whether `mobile` was set explicitly
             # or inherited from the registration session.
@@ -255,6 +280,8 @@ async def acquire_tokens_via_browser(
             logger.info(
                 f"[oauth] Starting PKCE OAuth flow for {email} [{_fp_label}]"
             )
+            if log_fn:
+                log_fn(f"[OAuth] 开始获取访问令牌…")
 
             # ── Navigate to OAuth authorize endpoint ─────────────────────
             try:
@@ -272,10 +299,13 @@ async def acquire_tokens_via_browser(
 
             if captured:
                 logger.info("[oauth] Code immediately captured — exchanging for tokens")
+                if log_fn:
+                    log_fn("[OAuth] 授权码已获取，正在交换令牌…")
                 return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
             # ── Handle Auth0 login page ──────────────────────────────────
             await asyncio.sleep(2.0)
+            _sync_capture_from_url()
             current_url = oauth_page.url
             logger.debug(f"[oauth] Post-goto URL: {current_url}")
 
@@ -284,6 +314,8 @@ async def acquire_tokens_via_browser(
                     f"[oauth] Auth0 login page detected — filling credentials "
                     f"({'mobile UA' if mobile else 'desktop UA'})"
                 )
+                if log_fn:
+                    log_fn("[OAuth] 检测到登录页，正在填写凭据…")
 
                 email_result = await wait_any_element(
                     oauth_page,
@@ -317,16 +349,48 @@ async def acquire_tokens_via_browser(
 
                         # ── Handle email OTP verification (if Auth0 requires it) ──
                         if mail_client:
-                            await _handle_oauth_otp(oauth_page, email, mail_client, _to)
+                            await _handle_oauth_otp(oauth_page, email, mail_client, _to, log_fn=log_fn)
                     else:
-                        logger.warning("[oauth] Password input not found on login page")
+                        # Auth0 may have skipped the password step and gone straight
+                        # to email OTP verification (passwordless flow).
+                        logger.info(
+                            "[oauth] Password input not found after email submit — "
+                            "Auth0 may have jumped directly to OTP step"
+                        )
+                        if log_fn:
+                            log_fn("[OAuth] 未出现密码框，检测是否直接跳到验证码步骤…")
+                        if mail_client:
+                            await _handle_oauth_otp(oauth_page, email, mail_client, _to, log_fn=log_fn)
+                        else:
+                            logger.warning(
+                                "[oauth] Password input not found and no mail_client — cannot proceed"
+                            )
                 else:
                     logger.warning("[oauth] No password provided — cannot log in via OAuth login page")
+                    # Even without a password, Auth0 may show a passwordless OTP flow.
+                    if mail_client:
+                        logger.info("[oauth] No password — attempting passwordless OTP detection")
+                        if log_fn:
+                            log_fn("[OAuth] 无密码模式，尝试检测验证码步骤…")
+                        await _handle_oauth_otp(oauth_page, email, mail_client, _to, log_fn=log_fn)
+
+            # ── Early-capture check: code may have arrived during login/OTP ──
+            # Give the event loop a tick so any in-flight route handlers can run.
+            await asyncio.sleep(0.5)
+            _sync_capture_from_url()
+            if captured:
+                logger.info("[oauth] Code captured during login/OTP phase — exchanging for tokens")
+                if log_fn:
+                    log_fn("[OAuth] 授权码已获取（登录阶段），正在交换令牌…")
+                return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
             # ── Handle consent / about-you / workspace pages ─────────────
             for attempt in range(1, 8):
+                _sync_capture_from_url()
                 if captured:
                     logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                    if log_fn:
+                        log_fn("[OAuth] 授权码已获取，正在交换令牌…")
                     return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
                 logger.info(f"[oauth] Attempting OAuth flow click-through (try {attempt})")
@@ -336,6 +400,8 @@ async def acquire_tokens_via_browser(
                     ln = last_name or "Smith"
                     bd = birthday or {"year": 1990, "month": 6, "day": 15}
                     logger.info(f"[oauth] About-you page — filling profile ({fn} {ln})")
+                    if log_fn:
+                        log_fn(f"[OAuth] 填写 about-you 个人资料页…")
                     await _fill_about_you_js(oauth_page, fn, ln, bd)
                     await asyncio.sleep(1.5)
 
@@ -355,12 +421,25 @@ async def acquire_tokens_via_browser(
                 await human_move_and_click(oauth_page, btn)
 
                 await asyncio.sleep(3.0)
-
+                _sync_capture_from_url()
                 if captured:
                     logger.info(f"[oauth] Code captured (len={len(captured[0])}) — exchanging for tokens")
+                    if log_fn:
+                        log_fn("[OAuth] 授权码已获取，正在交换令牌…")
                     return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
+            # ── Final fallback: code may have been captured during the loop ──
+            await asyncio.sleep(0.5)
+            _sync_capture_from_url()
+            if captured:
+                logger.info("[oauth] Late code capture after consent loop — exchanging for tokens")
+                if log_fn:
+                    log_fn("[OAuth] 授权码已获取（延迟），正在交换令牌…")
+                return await _exchange_code(captured[0], verifier, email, proxy, _to)
+
             logger.warning(f"[oauth] Failed to complete OAuth flow for {email} — code not captured")
+            if log_fn:
+                log_fn("[OAuth] ⚠️ 授权流程失败，未能获取授权码")
             return None
 
         try:
@@ -368,6 +447,8 @@ async def acquire_tokens_via_browser(
             return result
         except asyncio.TimeoutError:
             logger.warning(f"[oauth] OAuth flow timed out after {_total}s for {email}")
+            if log_fn:
+                log_fn(f"[OAuth] ⚠️ 令牌获取超时（>{_total}s）")
             return None
         finally:
             try:
@@ -379,16 +460,128 @@ async def acquire_tokens_via_browser(
 
 # ── OAuth OTP handling ────────────────────────────────────────────────────────
 
+# Keywords that indicate Auth0 rejected the submitted OTP code.
+_OAUTH_OTP_ERROR_KEYWORDS = (
+    "incorrect code",
+    "invalid code",
+    "wrong code",
+    "code is incorrect",
+    "code is invalid",
+    "code has expired",
+    "code expired",
+    "验证码错误",
+    "验证码无效",
+    "验证码已过期",
+    "输入的验证码不正确",
+    "code entered is incorrect",
+)
+
+
+async def _oauth_otp_is_incorrect(page: Page) -> bool:
+    """Return True if Auth0 is showing an OTP-rejected error message."""
+    try:
+        text: str = await page.evaluate("""
+            () => {
+                const picks = [
+                    ...document.querySelectorAll('[role="alert"]'),
+                    ...document.querySelectorAll('[aria-live]'),
+                    ...document.querySelectorAll('[class*="error"],[class*="invalid"],[class*="alert"]'),
+                    ...document.querySelectorAll('p, span, small'),
+                ];
+                return picks
+                    .filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    })
+                    .map(el => (el.innerText || "").toLowerCase())
+                    .join(" ");
+            }
+        """)
+        return any(kw in text for kw in _OAUTH_OTP_ERROR_KEYWORDS)
+    except Exception:
+        return False
+
+
+async def _oauth_otp_inputs_present(page: Page) -> bool:
+    """Return True if OTP input controls are still visible on the current page."""
+    _OTP_BOX = "input[type='text'][maxlength='1'], input[maxlength='1']"
+    try:
+        if await page.locator(_OTP_BOX).count() >= 4:
+            return True
+    except Exception:
+        pass
+    for sel in ("input[autocomplete='one-time-code']", "input[name='code']", "input[id*='code']"):
+        try:
+            if await page.locator(sel).first.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _oauth_click_resend(page: Page) -> bool:
+    """Click the 'Resend' button on the Auth0 OTP page. Returns True on success."""
+    for text in ("Resend email", "Resend", "Send again", "重新发送", "Didn't receive"):
+        for loc in (
+            page.get_by_role("button", name=text, exact=False),
+            page.get_by_role("link",   name=text, exact=False),
+            page.get_by_text(text, exact=False),
+        ):
+            try:
+                if await loc.first.is_visible(timeout=800):
+                    await loc.first.click()
+                    logger.info(f"[oauth] Resend button clicked ({text!r})")
+                    return True
+            except Exception:
+                pass
+    for sel in ("[data-action-button-secondary]", "button[class*='resend']", "a[class*='resend']"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=500):
+                await loc.click()
+                logger.info(f"[oauth] Resend button clicked (CSS: {sel!r})")
+                return True
+        except Exception:
+            pass
+    logger.debug(f"[oauth] Resend button not found (URL={page.url})")
+    return False
+
+
+async def _oauth_poll_fresh_code(
+    mail_client: MailClient,
+    email: str,
+    *,
+    previous_code: Optional[str],
+    timeout: int,
+) -> Optional[str]:
+    """Poll mailbox until a code *different* from previous_code arrives."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        remaining = max(1, int(deadline - asyncio.get_event_loop().time()))
+        fresh = await mail_client.poll_code(email, timeout=min(15, remaining))
+        if fresh and fresh != previous_code:
+            return fresh
+        if fresh == previous_code:
+            logger.debug(f"[oauth] Still seeing old OTP {fresh} — waiting for new one")
+        await asyncio.sleep(1.0)
+    return None
+
+
 async def _handle_oauth_otp(
     page: Page,
     email: str,
     mail_client: MailClient,
     timeouts: dict,
+    log_fn=None,
 ) -> None:
     """
     After the OAuth login page password submit, detect whether Auth0 shows an
     email OTP verification step and, if so, poll the mailbox for the code,
     fill it, then click Continue.
+
+    If Auth0 rejects the code ("Incorrect code"), the function automatically
+    clicks the Resend button, polls for a *fresh* code (different from the
+    previous one), and retries up to ``_OAUTH_OTP_WRONG_MAX`` times.
 
     OTP input detection mirrors register.py ``_wait_for_otp_inputs``:
       - ≥ 4 individual maxlength=1 boxes  → fill digit-by-digit
@@ -430,6 +623,8 @@ async def _handle_oauth_otp(
         return
 
     logger.info(f"[oauth] Email OTP required — polling inbox for {email}")
+    if log_fn:
+        log_fn("[OAuth] 检测到邮箱验证码步骤，正在获取验证码…")
 
     # ── Poll mailbox ──────────────────────────────────────────────────────────
     otp_timeout = int(timeouts.get("otp_code", 180))
@@ -437,16 +632,22 @@ async def _handle_oauth_otp(
 
     if not code:
         logger.warning(f"[oauth] OTP code not received within {otp_timeout}s — continuing without fill")
+        if log_fn:
+            log_fn("[OAuth] ⚠️ 验证码超时未收到，跳过 OTP 填写")
         return
 
     logger.info(f"[oauth] OTP code received — filling: {code}")
+    if log_fn:
+        log_fn(f"[OAuth] 验证码已获取，正在填写…")
 
-    # ── Fill OTP inputs (mirrors register.py _fill_otp) ──────────────────────
-    try:
+    # ── Fill + submit loop with Incorrect-Code retry ──────────────────────────
+    _OAUTH_OTP_WRONG_MAX = 2
+
+    async def _fill_otp_inputs(otp_code: str) -> None:
         boxes = page.locator(_OTP_BOX)
-        count = await boxes.count()
-        if count >= 4:
-            for i, ch in enumerate(code[:count]):
+        box_count = await boxes.count()
+        if box_count >= 4:
+            for i, ch in enumerate(otp_code[:box_count]):
                 box = boxes.nth(i)
                 try:
                     await box.click()
@@ -456,17 +657,90 @@ async def _handle_oauth_otp(
                 await asyncio.sleep(0.1)
         else:
             for sel in _OTP_SINGLE:
-                ok = await set_react_input(page, sel, code)
+                ok = await set_react_input(page, sel, otp_code)
                 if ok:
                     break
-    except Exception as exc:
-        logger.warning(f"[oauth] OTP fill error: {exc}")
+
+    for _wrong_attempt in range(_OAUTH_OTP_WRONG_MAX + 1):
+        if _wrong_attempt > 0:
+            logger.warning(
+                f"[oauth] OTP 被判定错误，准备重发并拉取新验证码 "
+                f"（第 {_wrong_attempt}/{_OAUTH_OTP_WRONG_MAX} 次）"
+            )
+            if log_fn:
+                log_fn(
+                    f"[OAuth] ⚠️ 验证码错误，重新发送并获取新验证码"
+                    f"（{_wrong_attempt}/{_OAUTH_OTP_WRONG_MAX}）…"
+                )
+
+            resent = await _oauth_click_resend(page)
+            if not resent:
+                logger.warning("[oauth] 重发按钮未找到，停止 OTP 重试")
+                if log_fn:
+                    log_fn("[OAuth] ⚠️ 未找到重发按钮，放弃重试")
+                break
+
+            await asyncio.sleep(3.0)
+            new_code = await _oauth_poll_fresh_code(
+                mail_client, email,
+                previous_code=code,
+                timeout=otp_timeout,
+            )
+            if not new_code:
+                logger.warning("[oauth] 重发后未收到新验证码，放弃重试")
+                if log_fn:
+                    log_fn("[OAuth] ⚠️ 重发后仍未收到新验证码")
+                break
+
+            code = new_code
+            logger.info(f"[oauth] 新验证码 → {code}")
+            if log_fn:
+                log_fn(f"[OAuth] 新验证码已获取，正在填写…")
+
+        # ── Fill OTP inputs ───────────────────────────────────────────────────
+        try:
+            await _fill_otp_inputs(code)
+        except Exception as exc:
+            logger.warning(f"[oauth] OTP fill error: {exc}")
+            return
+
+        await asyncio.sleep(1.0)
+        await click_submit_or_text(page, ["Continue", "Verify", "Submit", "继续"])
+
+        # ── Wait up to 6 s and classify the result ────────────────────────────
+        _deadline = asyncio.get_event_loop().time() + 6.0
+        _result = "pending"
+        while asyncio.get_event_loop().time() < _deadline:
+            if await _oauth_otp_is_incorrect(page):
+                _result = "incorrect"
+                break
+            # Accepted if OTP inputs disappeared (page advanced) or URL changed
+            if not await _oauth_otp_inputs_present(page):
+                _result = "accepted"
+                break
+            await asyncio.sleep(0.5)
+
+        if _result == "accepted":
+            logger.info(f"[oauth] OTP accepted — continuing OAuth flow")
+            if log_fn:
+                log_fn("[OAuth] 验证码已验证，继续流程…")
+            return
+
+        if _result == "incorrect":
+            logger.warning(
+                f"[oauth] Auth0 rejected OTP (attempt {_wrong_attempt + 1}/{_OAUTH_OTP_WRONG_MAX + 1})"
+            )
+            continue   # → next iteration: resend + fresh code
+
+        # pending — no decisive signal; treat as accepted and let the flow continue
+        logger.info(f"[oauth] OTP submit result pending — continuing OAuth flow")
+        if log_fn:
+            log_fn("[OAuth] 验证码已提交，继续流程…")
         return
 
-    await asyncio.sleep(1.0)
-    await click_submit_or_text(page, ["Continue", "Verify", "Submit", "继续"])
-    await asyncio.sleep(3.0)
-    logger.info(f"[oauth] OTP submitted — continuing OAuth flow")
+    logger.warning(f"[oauth] OTP verification failed after {_OAUTH_OTP_WRONG_MAX + 1} attempts")
+    if log_fn:
+        log_fn("[OAuth] ⚠️ OTP 多次错误，放弃重试")
 
 
 # ── About-you profile fill helper ────────────────────────────────────────────
@@ -684,12 +958,4 @@ async def _exchange_code(
         f"account_id={result.account_id} expires={result.expires_at}"
     )
     return result
-
-
-
-
-
-
-
-
 

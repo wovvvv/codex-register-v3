@@ -294,6 +294,8 @@ async def register_one(
                 if cfg.get("enable_oauth", True):
                     try:
                         from src.browser.oauth import acquire_tokens_via_browser
+                        if log_fn:
+                            log_fn("步骤 8/8: 获取 OAuth 访问令牌…")
                         token = await acquire_tokens_via_browser(
                             page=page,
                             email=email,
@@ -305,6 +307,7 @@ async def register_one(
                             timeouts=timeouts,
                             mail_client=mail_client,
                             mobile=False,   # page already carries the correct fingerprint
+                            log_fn=log_fn,
                         )
                         if token:
                             account.update(token.to_dict())
@@ -313,15 +316,21 @@ async def register_one(
                                 f"account_id={token.account_id} "
                                 f"expires={token.expires_at}"
                             )
+                            if log_fn:
+                                log_fn(f"[OAuth] ✅ 令牌获取成功 account_id={token.account_id}")
                         else:
                             logger.warning(
                                 f"[{task_id}] OAuth step returned None — "
                                 "registration result saved without tokens"
                             )
+                            if log_fn:
+                                log_fn("[OAuth] ⚠️ 令牌获取失败，注册结果已保存（无令牌）")
                     except Exception as _oe:
                         logger.warning(
                             f"[{task_id}] OAuth step error (non-fatal): {_oe}"
                         )
+                        if log_fn:
+                            log_fn(f"[OAuth] ⚠️ 令牌获取异常（非致命）: {_oe}")
 
                 return account
 
@@ -1178,20 +1187,75 @@ async def _fill_profile(task_id: str, page: Page, account: dict, timeouts: dict)
                 logger.debug(f"[{task_id}] Spinbutton[{i}] {field}={val} done")
 
         else:
-            # Fewer than 3 spinbuttons — try date input fallback
+            # Fewer than 3 spinbuttons — try <select> dropdowns first, then date input
             logger.debug(
                 f"[{task_id}] Only {len(sb_info) if sb_info else 0} spinbutton(s) — "
-                "trying date input fallback"
+                "trying <select> dropdowns then date input"
             )
-            date_found = False
-            for sel in ["input[type='date']", "input[name*='birth']", "input[id*='birth']"]:
-                if await is_visible(page, sel):
-                    await set_react_input(page, sel, date_str)
-                    logger.info(f"[{task_id}] Birthday via date selector {sel!r}: {date_str}")
-                    date_found = True
-                    break
-            if not date_found:
-                logger.warning(f"[{task_id}] Birthday input not found — skipping")
+
+            # ── Try <select> dropdown birthday pickers ────────────────────────
+            _month_names = [
+                "january", "february", "march", "april", "may", "june",
+                "july", "august", "september", "october", "november", "december",
+            ]
+            select_filled: int = await page.evaluate("""
+                ([month, day, year, monthNames]) => {
+                    function fillSel(el, val, isMo) {
+                        const strVal = String(val);
+                        const padVal = strVal.padStart(2, '0');
+                        const moName = isMo ? monthNames[val - 1] : '';
+                        for (const opt of el.options) {
+                            const v = opt.value.toLowerCase();
+                            const t = opt.text.toLowerCase();
+                            if (v === strVal || v === padVal ||
+                                (isMo && (t.includes(moName) || v.includes(moName)))) {
+                                el.value = opt.value;
+                                el.dispatchEvent(new Event('change', {bubbles: true}));
+                                el.dispatchEvent(new Event('input',  {bubbles: true}));
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    const selects = Array.from(document.querySelectorAll('select')).filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    let filled = 0;
+                    for (const el of selects) {
+                        const hint = (
+                            el.name + ' ' + el.id + ' ' +
+                            (el.getAttribute('aria-label') || '') + ' ' +
+                            (el.getAttribute('placeholder') || '')
+                        ).toLowerCase();
+                        const cnt = el.options.length;
+                        let val, isMo = false;
+                        if      (hint.includes('month') || cnt === 12 || cnt === 13) { val = month; isMo = true; }
+                        else if (hint.includes('year')  || cnt > 50)                  { val = year;  }
+                        else if (hint.includes('day')   || (cnt >= 28 && cnt <= 32))  { val = day;   }
+                        else continue;
+                        if (fillSel(el, val, isMo)) filled++;
+                    }
+                    return filled;
+                }
+            """, [bd["month"], bd["day"], bd["year"], _month_names])
+
+            if select_filled and select_filled > 0:
+                logger.info(f"[{task_id}] Birthday filled via {select_filled} <select> dropdown(s)")
+            else:
+                # Fall back to date input
+                date_found = False
+                for sel in ["input[type='date']", "input[name*='birth']", "input[id*='birth']"]:
+                    if await is_visible(page, sel):
+                        await set_react_input(page, sel, date_str)
+                        logger.info(f"[{task_id}] Birthday via date selector {sel!r}: {date_str}")
+                        date_found = True
+                        break
+                if not date_found:
+                    logger.warning(
+                        f"[{task_id}] Birthday input not found — skipping "
+                        f"(selects_filled={select_filled})"
+                    )
 
     except Exception as _e:
         logger.warning(f"[{task_id}] Spinbutton fill error: {_e}")

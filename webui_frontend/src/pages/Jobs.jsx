@@ -269,7 +269,17 @@ export function Jobs() {
           </div>
           <div ref={logRef} className="log-terminal bg-gray-950 text-green-400 p-4 h-64 overflow-y-auto">
             {detail?.logs?.length
-              ? detail.logs.map((line, i) => <div key={i}>{line}</div>)
+              ? detail.logs.map((line, i) => {
+                  const isOAuth = line.includes('[OAuth]')
+                  const isWarn  = line.includes('⚠️') || line.includes('错误') || line.includes('失败')
+                  const isOk    = line.includes('✅') || line.includes('成功')
+                  let cls = 'text-green-400'
+                  if (isOAuth && isOk)   cls = 'text-blue-400 font-medium'
+                  else if (isOAuth && isWarn) cls = 'text-yellow-400'
+                  else if (isOAuth)      cls = 'text-cyan-400'
+                  else if (isWarn)       cls = 'text-yellow-500'
+                  return <div key={i} className={cls}>{line}</div>
+                })
               : <span className="text-gray-600">等待日志…</span>
             }
           </div>

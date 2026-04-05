@@ -15,6 +15,7 @@ from typing import Literal
 from playwright.async_api import Page, Locator, TimeoutError as PWTimeoutError
 
 import src.config as _cfg_mod
+import src.settings_db as _settings_db
 
 # ── React-compatible input fill ───────────────────────────────────────────
 
@@ -367,25 +368,39 @@ async def human_move_and_click(page: Page, locator: Locator) -> None:
     Auth0 / Cloudflare track mouse history before a click; a direct
     playwright .click() with no prior movement is a strong bot signal.
 
-    All timing/step parameters are read from config.yaml under the ``mouse:``
-    key so they can be tuned without touching source code:
+    Configuration is read from the DB ``mouse`` section (set via the WebUI
+    advanced page).  Falls back to YAML defaults if the DB is unavailable.
 
         mouse:
-          steps_min:       4      # min micro-steps along arc
-          steps_max:       8      # max micro-steps along arc
-          step_delay_min:  0.003  # min sleep per step (seconds)
-          step_delay_max:  0.010  # max sleep per step (seconds)
-          hover_min:       0.02   # min hover pause before click (seconds)
-          hover_max:       0.08   # max hover pause before click (seconds)
+          human_simulation: true   # false → plain locator.click() (faster)
+          steps_min:       4
+          steps_max:       8
+          step_delay_min:  0.003
+          step_delay_max:  0.010
+          hover_min:       0.02
+          hover_max:       0.08
     """
-    # Load mouse-movement config (falls back to defaults if key absent)
-    _mc = _cfg_mod.get("mouse") or {}
-    steps_min      = float(_mc.get("steps_min",      4))
-    steps_max      = float(_mc.get("steps_max",      8))
-    step_dmin      = float(_mc.get("step_delay_min", 0.003))
-    step_dmax      = float(_mc.get("step_delay_max", 0.010))
-    hover_min      = float(_mc.get("hover_min",      0.02))
-    hover_max      = float(_mc.get("hover_max",      0.08))
+    # ── Load mouse config from DB (source of truth) ───────────────────────────
+    try:
+        _mc = await _settings_db.get_section("mouse") or {}
+    except Exception:
+        _mc = _cfg_mod.get("mouse") or {}
+
+    # ── Fast path: human simulation disabled → direct click ───────────────────
+    if not _mc.get("human_simulation", True):
+        try:
+            await locator.click()
+        except Exception as exc:
+            logger.debug(f"[helpers] direct click error: {exc}")
+        return
+
+    # ── Slow path: curved-path human-like movement then click ─────────────────
+    steps_min = float(_mc.get("steps_min",      4))
+    steps_max = float(_mc.get("steps_max",      8))
+    step_dmin = float(_mc.get("step_delay_min", 0.003))
+    step_dmax = float(_mc.get("step_delay_max", 0.010))
+    hover_min = float(_mc.get("hover_min",      0.02))
+    hover_max = float(_mc.get("hover_max",      0.08))
 
     try:
         box = await locator.bounding_box()
@@ -393,25 +408,20 @@ async def human_move_and_click(page: Page, locator: Locator) -> None:
             await locator.click()
             return
 
-        # Random landing point within middle 60% of element
         target_x = box["x"] + box["width"]  * random.uniform(0.2, 0.8)
         target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+        start_x  = random.randint(200, 900)
+        start_y  = random.randint(150, 600)
 
-        # Start from a plausible "previous" cursor position
-        start_x = random.randint(200, 900)
-        start_y = random.randint(150, 600)
-
-        # Move in N micro-steps with ease-in-out + slight per-step noise
         steps = random.randint(int(steps_min), int(steps_max))
         for i in range(1, steps + 1):
             t = i / steps
-            t = t * t * (3.0 - 2.0 * t)          # smoothstep easing
+            t = t * t * (3.0 - 2.0 * t)   # smoothstep easing
             x = start_x + (target_x - start_x) * t + random.uniform(-2, 2)
             y = start_y + (target_y - start_y) * t + random.uniform(-2, 2)
             await page.mouse.move(x, y)
             await asyncio.sleep(random.uniform(step_dmin, step_dmax))
 
-        # Brief human "hover" pause before pressing
         await asyncio.sleep(random.uniform(hover_min, hover_max))
         await page.mouse.click(target_x, target_y)
 

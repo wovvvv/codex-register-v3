@@ -1,6 +1,7 @@
 """
-config.py — Runtime configuration manager (replaces GM_getValue / GM_setValue).
-All settings are persisted in config.yaml at the project root.
+config.py — Code-level default fallback.
+All settings are now stored in SQLite (settings_db).
+config.yaml is read ONCE at startup for one-time migration and then ignored.
 """
 from __future__ import annotations
 
@@ -12,74 +13,58 @@ import yaml
 CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 
 _DEFAULTS: dict[str, Any] = {
+    # ── Operational (primary store: DB "general" section) ──────────────────
     "engine": "playwright",
-    "headless": True,          # True = invisible batch mode; False = visible headed window
-    "slow_mo": 0,              # extra ms between actions; 0 = auto (80 ms when headed)
-    "mobile": False,           # True = use mobile fingerprint for the entire registration flow
+    "headless": True,
+    "slow_mo": 0,
+    "mobile": False,
     "max_concurrent": 2,
     "mail_provider": "gptmail",
     "mail": {
         "gptmail":  {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
         "npcmail":  {"api_key": "", "base_url": "https://dash.xphdfs.me"},
         "yydsmail": {"api_key": "", "base_url": "https://maliapi.215.im/v1"},
-        # imap: list of one or more IMAP accounts.
-        # qq.com and gmail.com domains automatically enable '+alias' mode.
-        # Set use_alias: true/false explicitly to override auto-detection.
-        "imap": [
-            {
-                "email":     "",       # full mailbox address, e.g. user@gmail.com
-                "password":  "",       # IMAP account password (Gmail: app-specific password)
-                "host":      "",       # IMAP server hostname, e.g. imap.gmail.com
-                "port":      993,      # 993 = IMAPS (SSL), 143 = STARTTLS / plain
-                "ssl":       True,     # True = IMAPS; False = STARTTLS / plain
-                "folder":    "INBOX",  # folder to watch for verification emails
-                # "use_alias": None,   # None = auto-detect from domain
-            },
-        ],
+        "imap": [],
     },
     "registration": {"prefix": "", "domain": ""},
     "proxy_strategy": "pool",
     "proxy_static": "",
     "team": {"url": "", "key": ""},
     "sync":  {"url": "", "key": ""},
-    # Set to false to skip the post-registration Codex OAuth token step.
     "enable_oauth": True,
-    # ── Per-stage timeout configuration (all values in seconds) ──────────────
-    # Override any value in config.yaml under the `timeouts:` key.
-    # ── Human mouse-movement simulation ──────────────────────────────────────
-    # Reduce these values to speed up clicks; increase to appear more human-like.
+    # ── Mouse (primary store: DB "mouse" section) ──────────────────────────
     "mouse": {
-        "steps_min":       4,     # min micro-steps along the movement arc
-        "steps_max":       8,     # max micro-steps along the movement arc
-        "step_delay_min":  0.003, # min sleep per step (seconds)
-        "step_delay_max":  0.010, # max sleep per step (seconds)
-        "hover_min":       0.02,  # min hover pause before the click (seconds)
-        "hover_max":       0.08,  # max hover pause before the click (seconds)
+        "human_simulation": True,
+        "steps_min":       4,
+        "steps_max":       8,
+        "step_delay_min":  0.003,
+        "step_delay_max":  0.010,
+        "hover_min":       0.02,
+        "hover_max":       0.08,
     },
+    # ── Timeouts (primary store: DB "timeouts" section) ────────────────────
     "timeouts": {
-        # Registration flow
-        "page_load":            30,   # page.goto() for login / retry navigations
-        "auth0_redirect":       8,    # wait_for_url to auth.openai.com after landing
-        "email_input":          15,   # wait for email input on signup page
-        "password_input":       60,   # wait for password input after email submit
-        "otp_input":            60,   # wait for OTP input boxes after password submit
-        "otp_code":             180,  # poll mail inbox for the 6-digit OTP code
-        "profile_detect":       15,   # wait for firstName input (profile page detection)
-        "profile_field":        5,    # wait for each name/date field inside profile page
-        "complete_redirect":    20,   # wait_for_url to chatgpt.com (registration done)
-        # OAuth flow
-        "oauth_navigate":       20,   # page.goto() to /oauth/authorize
-        "oauth_flow_element":   8,    # wait_any_element for consent/continue button per attempt
-        "oauth_login_email":    8,    # wait for email input on OAuth re-login page
-        "oauth_login_password": 10,   # wait for password input on OAuth re-login page
-        "oauth_token_exchange": 30,   # httpx timeout for /oauth/token POST
-        "oauth_total":          45,   # hard deadline for the entire OAuth flow
+        "page_load":            30,
+        "auth0_redirect":       8,
+        "email_input":          15,
+        "password_input":       60,
+        "otp_input":            60,
+        "otp_code":             180,
+        "profile_detect":       15,
+        "profile_field":        5,
+        "complete_redirect":    20,
+        "oauth_navigate":       20,
+        "oauth_flow_element":   8,
+        "oauth_login_email":    8,
+        "oauth_login_password": 10,
+        "oauth_token_exchange": 30,
+        "oauth_total":          45,
     },
 }
 
 
 def load() -> dict[str, Any]:
-    """Load config from config.yaml, merging with defaults."""
+    """Load config.yaml merged with code defaults. Used only as migration source."""
     if not CONFIG_PATH.exists():
         return dict(_DEFAULTS)
     with CONFIG_PATH.open(encoding="utf-8") as f:
@@ -88,7 +73,7 @@ def load() -> dict[str, Any]:
 
 
 def get(key: str, default: Any = None) -> Any:
-    """Dot-notation getter.  e.g. get('mail.gptmail.api_key')"""
+    """Dot-notation getter (code-level fallback only)."""
     cfg = load()
     parts = key.split(".")
     val: Any = cfg
@@ -101,9 +86,7 @@ def get(key: str, default: Any = None) -> Any:
 
 
 def set_key(key: str, value: Any) -> None:
-    """Dot-notation setter.  e.g. set_key('engine', 'camoufox')
-    Automatically coerces integers, floats, and booleans from string input.
-    """
+    """Write a key to config.yaml (legacy; prefer settings_db for new code)."""
     if isinstance(value, str):
         if value.lower() in ("true", "false"):
             value = value.lower() == "true"
@@ -114,7 +97,7 @@ def set_key(key: str, value: Any) -> None:
                 try:
                     value = float(value)
                 except ValueError:
-                    pass  # keep as string
+                    pass
     cfg = load()
     parts = key.split(".")
     d = cfg
@@ -139,4 +122,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
 

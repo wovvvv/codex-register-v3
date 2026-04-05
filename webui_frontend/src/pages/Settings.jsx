@@ -1135,15 +1135,30 @@ function TabAdvanced() {
   return (
     <div className="space-y-4">
       <Section title="鼠标模拟配置">
-        {[
-          ['steps_min','最少弧线步数'],['steps_max','最多弧线步数'],
-          ['step_delay_min','每步最短延迟 (秒)'],['step_delay_max','每步最长延迟 (秒)'],
-          ['hover_min','悬停最短时间 (秒)'],['hover_max','悬停最长时间 (秒)'],
-        ].map(([k, label]) => (
-          <Field key={k} label={label}>
-            <Input type="number" step="0.001" min={0} value={mouse[k] ?? ''} onChange={e => setMouse(d => ({ ...d, [k]: +e.target.value }))} />
-          </Field>
-        ))}
+        <Field label="人工模拟点击" hint="开启后模拟曲线鼠标轨迹，提升防检测；关闭则直接点击，速度更快">
+          <div className="flex items-center gap-3">
+            <Toggle
+              checked={mouse.human_simulation !== false}
+              onChange={v => setMouse(d => ({ ...d, human_simulation: v }))}
+            />
+            <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+              mouse.human_simulation !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'
+            }`}>
+              {mouse.human_simulation !== false ? '🖱️ 模拟轨迹' : '⚡ 直接点击'}
+            </span>
+          </div>
+        </Field>
+        <div className={mouse.human_simulation === false ? 'opacity-40 pointer-events-none select-none' : ''}>
+          {[
+            ['steps_min','最少弧线步数'],['steps_max','最多弧线步数'],
+            ['step_delay_min','每步最短延迟 (秒)'],['step_delay_max','每步最长延迟 (秒)'],
+            ['hover_min','悬停最短时间 (秒)'],['hover_max','悬停最长时间 (秒)'],
+          ].map(([k, label]) => (
+            <Field key={k} label={label}>
+              <Input type="number" step="0.001" min={0} value={mouse[k] ?? ''} onChange={e => setMouse(d => ({ ...d, [k]: +e.target.value }))} />
+            </Field>
+          ))}
+        </div>
       </Section>
       <Section title="等待时间配置 (秒)">
         {[

@@ -236,18 +236,21 @@ async def _run_job(job: _Job) -> None:
         logger.exception(f"[webui] Job {job.id} fatal")
 
 
-# ── Config API (YAML-backed, common settings) ─────────────────────────────
+# ── Config API (DB-backed, general section) ───────────────────────────────
 
 @app.get("/api/config")
 async def api_get_config():
-    return cfg_mod.load()
+    """Return the DB general section (engine, headless, proxy, etc.)."""
+    return await settings_db.get_section("general")
 
 
 @app.post("/api/config")
 async def api_set_config(request: Request):
+    """Merge-update the DB general section."""
     body: dict = await request.json()
-    for key, value in body.items():
-        cfg_mod.set_key(key, value)
+    existing = await settings_db.get_section("general")
+    existing.update(body)
+    await settings_db.set_section("general", existing)
     return {"ok": True}
 
 

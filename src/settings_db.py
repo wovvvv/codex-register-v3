@@ -1,7 +1,7 @@
 """
-settings_db.py — WebUI-managed configuration stored in SQLite.
-Non-common settings (mail credentials, timeouts, mouse, etc.) live here.
-Common/operational settings (engine, headless, concurrency, proxy) stay in config.yaml.
+settings_db.py — All WebUI configuration stored in SQLite.
+config.yaml is no longer the source of truth; it is used only as a one-time
+migration source and as a code-level fallback for missing keys.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from src.db import DB_PATH
 # ── Sections managed in DB ────────────────────────────────────────────────
 
 _SECTIONS = [
+    "general",       # engine, headless, mobile, concurrency, proxy, mail_provider
     "mail.gptmail",
     "mail.npcmail",
     "mail.yydsmail",
@@ -30,6 +31,16 @@ _SECTIONS = [
 ]
 
 _DEFAULTS: dict[str, Any] = {
+    "general": {
+        "engine":         "playwright",
+        "headless":       True,
+        "slow_mo":        0,
+        "mobile":         False,
+        "max_concurrent": 2,
+        "mail_provider":  "gptmail",
+        "proxy_strategy": "none",
+        "proxy_static":   "",
+    },
     "mail.gptmail":  {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
     "mail.npcmail":  {"api_key": "", "base_url": "https://dash.xphdfs.me"},
     "mail.yydsmail": {"api_key": "", "base_url": "https://maliapi.215.im/v1"},
@@ -40,34 +51,35 @@ _DEFAULTS: dict[str, Any] = {
     "sync": {"url": "", "key": ""},
     "oauth": {"enabled": True, "timeout": 45},
     "mouse": {
-        "steps_min": 4,
-        "steps_max": 8,
-        "step_delay_min": 0.003,
-        "step_delay_max": 0.010,
-        "hover_min": 0.02,
-        "hover_max": 0.08,
+        "human_simulation": True,
+        "steps_min":        4,
+        "steps_max":        8,
+        "step_delay_min":   0.003,
+        "step_delay_max":   0.010,
+        "hover_min":        0.02,
+        "hover_max":        0.08,
     },
     "timeouts": {
-        "page_load": 30,
-        "auth0_redirect": 8,
-        "email_input": 15,
-        "password_input": 60,
-        "otp_input": 60,
-        "otp_code": 180,
-        "profile_detect": 15,
-        "profile_field": 5,
-        "complete_redirect": 20,
-        "oauth_navigate": 20,
-        "oauth_flow_element": 8,
-        "oauth_login_email": 8,
+        "page_load":            30,
+        "auth0_redirect":       8,
+        "email_input":          15,
+        "password_input":       60,
+        "otp_input":            60,
+        "otp_code":             180,
+        "profile_detect":       15,
+        "profile_field":        5,
+        "complete_redirect":    20,
+        "oauth_navigate":       20,
+        "oauth_flow_element":   8,
+        "oauth_login_email":    8,
         "oauth_login_password": 10,
         "oauth_token_exchange": 30,
-        "oauth_total": 45,
+        "oauth_total":          45,
     },
     "timing": {
-        "post_nav": 1.0,
-        "pre_fill": 0.5,
-        "post_click": 1.5,
+        "post_nav":      1.0,
+        "pre_fill":      0.5,
+        "post_click":    1.5,
         "post_complete": 1.0,
     },
 }
@@ -89,7 +101,10 @@ async def _ensure_table() -> None:
 # ── Public API ────────────────────────────────────────────────────────────
 
 async def init_from_yaml() -> None:
-    """Migrate non-common settings from YAML to DB (only for missing sections)."""
+    """
+    One-time migration: read config.yaml and write any missing sections into DB.
+    After first run the DB is the sole source of truth; YAML is ignored.
+    """
     await _ensure_table()
     import src.config as cfg_mod
     yaml_cfg = cfg_mod.load()
@@ -104,8 +119,22 @@ async def init_from_yaml() -> None:
             if section in existing:
                 continue
 
-            if section.startswith("mail."):
-                provider = section[5:]  # e.g. "gptmail"
+            if section == "general":
+                # Migrate flat operational keys from YAML top-level
+                val = {
+                    "engine":         yaml_cfg.get("engine",         "playwright"),
+                    "headless":       yaml_cfg.get("headless",       True),
+                    "slow_mo":        yaml_cfg.get("slow_mo",        0),
+                    "mobile":         yaml_cfg.get("mobile",         False),
+                    "max_concurrent": yaml_cfg.get("max_concurrent", 2),
+                    "mail_provider":  yaml_cfg.get("mail_provider",  "gptmail"),
+                    "proxy_strategy": yaml_cfg.get("proxy_strategy", "none"),
+                    "proxy_static":   yaml_cfg.get("proxy_static",   ""),
+                }
+                to_insert.append((section, json.dumps(val, ensure_ascii=False)))
+
+            elif section.startswith("mail."):
+                provider = section[5:]
                 raw = yaml_cfg.get("mail", {}).get(provider, _DEFAULTS[section])
                 to_insert.append((section, json.dumps(raw, ensure_ascii=False)))
 
@@ -116,6 +145,15 @@ async def init_from_yaml() -> None:
                     "timeout": yaml_cfg.get("oauth", {}).get("timeout", 45),
                 }
                 to_insert.append((section, json.dumps(val, ensure_ascii=False)))
+
+            elif section == "mouse":
+                # Migrate mouse from YAML; also pick up human_simulation if present
+                yaml_mouse = dict(yaml_cfg.get("mouse", {}))
+                merged = {**_DEFAULTS["mouse"], **yaml_mouse}
+                # human_simulation was stored as top-level in YAML by previous versions
+                if "human_simulation" in yaml_cfg:
+                    merged["human_simulation"] = yaml_cfg["human_simulation"]
+                to_insert.append((section, json.dumps(merged, ensure_ascii=False)))
 
             elif section in yaml_cfg and yaml_cfg[section]:
                 to_insert.append((section, json.dumps(yaml_cfg[section], ensure_ascii=False)))
@@ -167,16 +205,25 @@ async def get_all() -> dict[str, Any]:
 
 async def build_config() -> dict[str, Any]:
     """
-    Build the complete runtime config dict.
-    Priority: YAML defaults (common settings) → DB settings (non-common settings).
+    Build the complete runtime config dict entirely from DB.
+    YAML (config.py defaults) is used only as a code-level fallback for
+    keys that are absent from the DB — not as the primary source.
+
+    Priority (highest → lowest):
+      DB general  >  DB per-section  >  YAML / code defaults
     """
     import src.config as cfg_mod
-    yaml_cfg = cfg_mod.load()
+    yaml_cfg = cfg_mod.load()   # code-level fallback only
     db = await get_all()
 
+    # Start from YAML as skeleton (provides structure / fallback defaults)
     cfg = dict(yaml_cfg)
 
-    # Mail credentials
+    # ── 1. General operational settings (DB overrides YAML) ───────────────
+    general_db = db.get("general", {})
+    cfg.update(general_db)   # engine, headless, mobile, concurrency, proxy …
+
+    # ── 2. Mail credentials ───────────────────────────────────────────────
     mail = cfg.setdefault("mail", {})
     for provider in ("gptmail", "npcmail", "yydsmail"):
         key = f"mail.{provider}"
@@ -187,17 +234,17 @@ async def build_config() -> dict[str, Any]:
     if db.get("mail.outlook") is not None:
         mail["outlook"] = db["mail.outlook"]
 
-    # Other non-common sections
+    # ── 3. Other per-section overrides ────────────────────────────────────
     for section in ("registration", "team", "sync", "mouse", "timeouts", "timing"):
         if db.get(section):
             cfg[section] = db[section]
 
-    # OAuth
+    # ── 4. OAuth ──────────────────────────────────────────────────────────
     oauth_db = db.get("oauth", {})
     if oauth_db:
         cfg["enable_oauth"] = oauth_db.get("enabled", True)
         cfg.setdefault("oauth", {})["enabled"] = oauth_db.get("enabled", True)
-        cfg.setdefault("oauth", {})["timeout"] = oauth_db.get("timeout", 45)
+        cfg.setdefault("oauth", {})["timeout"]  = oauth_db.get("timeout",  45)
         cfg.setdefault("timeouts", {})["oauth_total"] = oauth_db.get("timeout", 45)
 
     return cfg
