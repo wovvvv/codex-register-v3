@@ -9,11 +9,8 @@ import { EMPTY_SUB2API_UPLOAD_CONFIG, normalizeSub2APIUploadConfig, serializeSub
 function useProviderOptions() {
   const [opts, setOpts] = useState(DEFAULT_JOBS_PROVIDER_OPTIONS)
   useEffect(() => {
-    Promise.all([
-      api.getSettings(),
-      api.getOutlookStats().catch(() => null),
-    ]).then(([settings, outlookStats]) => {
-      setOpts(buildJobsProviderOptions(settings, { outlookStats }))
+    api.getSettings().then((settings) => {
+      setOpts(buildJobsProviderOptions(settings))
     }).catch(() => {})
   }, [])
   return opts

@@ -13,9 +13,14 @@ import {
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const pagesDir = path.resolve(__dirname, '../pages')
+const apiFile = path.resolve(__dirname, './api.js')
 
 function readPage(name) {
   return fs.readFileSync(path.join(pagesDir, name), 'utf8')
+}
+
+function readApi() {
+  return fs.readFileSync(apiFile, 'utf8')
 }
 
 test('Settings/Dashboard/Jobs 的 provider options 源包含 CF Worker', () => {
@@ -130,4 +135,12 @@ test('Dashboard/Jobs 不暴露空的 Outlook split provider family', () => {
   assert.equal(imapOnlyJobsOpts.some(([value]) => value === 'outlook-graph'), false)
   assert.equal(imapOnlyJobsOpts.some(([value]) => value === 'outlook-graph:0'), false)
   assert.equal(imapOnlyDashboardOpts.some(([value]) => value === 'outlook-imap'), true)
+})
+
+test('Start forms 与 API wrapper 不再引用 Outlook no-token stats', () => {
+  assert.doesNotMatch(readPage('Dashboard.jsx'), /getOutlookStats/)
+  assert.doesNotMatch(readPage('Jobs.jsx'), /getOutlookStats/)
+  assert.doesNotMatch(readPage('Dashboard.jsx'), /outlookStats/)
+  assert.doesNotMatch(readPage('Jobs.jsx'), /outlookStats/)
+  assert.doesNotMatch(readApi(), /getOutlookStats/)
 })

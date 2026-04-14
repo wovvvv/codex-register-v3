@@ -165,29 +165,6 @@ def _parse_outlook_provider_selector(provider: str) -> tuple[str, Optional[int]]
     return provider_lower, None
 
 
-def _build_outlook_rotation_stats(
-    configured_accounts: list[dict],
-    token_emails: Optional[set[str]] = None,
-) -> dict[str, int]:
-    configured = [
-        _normalize_email((acc or {}).get("email"))
-        for acc in (configured_accounts or [])
-        if isinstance(acc, dict)
-    ]
-    configured = [email for email in configured if email]
-    used = {
-        _normalize_email(email)
-        for email in (token_emails or set())
-        if _normalize_email(email)
-    }
-    with_token = sum(1 for email in configured if email in used)
-    return {
-        "configured": len(configured),
-        "with_token": with_token,
-        "without_token": max(0, len(configured) - with_token),
-    }
-
-
 # ── Background runner ─────────────────────────────────────────────────────
 
 async def _run_job(job: _Job) -> None:
@@ -582,13 +559,6 @@ async def api_import_outlook_save(request: Request):
     added = [a for a in new_acc if a.get("email", "").lower() not in existing_emails]
     await settings_db.set_section("mail.outlook", existing + added)
     return {"added": len(added), "total": len(existing) + len(added)}
-
-
-@app.get("/api/mail/outlook/stats")
-async def api_outlook_stats():
-    configured = await settings_db.get_section("mail.outlook")
-    token_emails = await accounts_mod.get_emails_with_access_token()
-    return _build_outlook_rotation_stats(configured, token_emails)
 
 
 # ── Accounts API ──────────────────────────────────────────────────────────
