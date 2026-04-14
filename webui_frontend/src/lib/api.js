@@ -16,6 +16,24 @@ async function req(method, path, body) {
   return res.json()
 }
 
+async function download(method, path, body) {
+  const opts = { method }
+  if (body !== undefined) {
+    opts.headers = { 'Content-Type': 'application/json' }
+    opts.body = JSON.stringify(body)
+  }
+  const res = await fetch(BASE + path, opts)
+  if (!res.ok) {
+    let msg = `${res.status}`
+    try { msg = (await res.json()).detail || msg } catch { /* ignore */ }
+    throw new Error(msg)
+  }
+  const blob = await res.blob()
+  const disposition = res.headers.get('Content-Disposition') || ''
+  const match = disposition.match(/filename="?([^"]+)"?/)
+  return { blob, filename: match?.[1] || 'download.bin' }
+}
+
 const api = {
   // ── Common config (YAML-backed) ─────────────────────────────────────
   getConfig:  ()       => req('GET',  '/config'),
@@ -33,13 +51,24 @@ const api = {
   saveImapAccounts:     (accounts) => req('POST', '/mail/import/imap/save',     { accounts }),
   parseOutlookAccounts: (text)     => req('POST', '/mail/import/outlook',       { text }),
   saveOutlookAccounts:  (accounts) => req('POST', '/mail/import/outlook/save',  { accounts }),
+  getOutlookStats:      ()         => req('GET',  '/mail/outlook/stats'),
 
   // ── Accounts ─────────────────────────────────────────────────────────
   getAccounts:        (params = {}) => req('GET',    '/accounts?' + new URLSearchParams(params)),
   getStats:           ()            => req('GET',    '/accounts/stats'),
   exportUrl:          (fmt)         => `${BASE}/accounts/export?fmt=${fmt}`,
+  exportTokenZip:     (body)        => download('POST', '/accounts/export-token-zip', body),
   deleteAccount:      (email)       => req('DELETE', `/accounts/${encodeURIComponent(email)}`),
   batchDeleteAccounts:(body)        => req('POST',   '/accounts/batch-delete', body),
+  uploadCliProxy:     (body)        => req('POST',   '/cli-proxy/upload', body),
+  uploadCliProxyBatch:(body)        => req('POST',   '/cli-proxy/upload-batch', body),
+  uploadSub2API:      (body)        => req('POST',   '/sub2api/upload', body),
+  uploadSub2APIBatch: (body)        => req('POST',   '/sub2api/upload-batch', body),
+  getCliProxyMonitorStatus: ()      => req('GET',    '/cli-proxy/monitor/status'),
+  startCliProxyMonitor:     ()      => req('POST',   '/cli-proxy/monitor/start'),
+  stopCliProxyMonitor:      ()      => req('POST',   '/cli-proxy/monitor/stop'),
+  runCliProxyMonitorOnce:   ()      => req('POST',   '/cli-proxy/monitor/run-once'),
+  getCliProxyMonitorHistory:(limit = 100) => req('GET', `/cli-proxy/monitor/history?limit=${limit}`),
 
   // ── Jobs ─────────────────────────────────────────────────────────────
   getJobs:         ()     => req('GET',    '/jobs'),
@@ -57,4 +86,3 @@ const api = {
 }
 
 export default api
-

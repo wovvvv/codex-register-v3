@@ -3,33 +3,16 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import api from '../lib/api.js'
 import { StatusBadge, Spinner } from '../components/Badge.jsx'
+import { buildDashboardProviderOptions, DEFAULT_DASHBOARD_PROVIDER_OPTIONS } from '../lib/cfworkerConfig.js'
 
 function useProviderOptions() {
-  const [opts, setOpts] = useState([['imap:0', 'IMAP 服务商 1']])
+  const [opts, setOpts] = useState(DEFAULT_DASHBOARD_PROVIDER_OPTIONS)
   useEffect(() => {
-    api.getSettings().then(s => {
-      const items = []
-      const imapProviders = Array.isArray(s['mail.imap']) ? s['mail.imap'] : []
-      const isNewFormat = imapProviders.length > 0 && 'accounts' in imapProviders[0]
-
-      if (isNewFormat) {
-        imapProviders.forEach((prov, i) => {
-          const name  = prov.name || `IMAP 服务商 ${i + 1}`
-          const count = Array.isArray(prov.accounts) ? prov.accounts.length : 0
-          items.push([`imap:${i}`, `${name} (${count} 账户)`])
-        })
-      } else {
-        imapProviders.forEach((acc, i) =>
-          items.push([`imap:${i}`, acc.email ? `IMAP: ${acc.email}` : `IMAP 账户 ${i + 1}`]))
-      }
-      if (!items.length) items.push(['imap:0', 'IMAP 服务商 1'])
-
-      const outlookAccounts = Array.isArray(s['mail.outlook']) ? s['mail.outlook'] : []
-      if (outlookAccounts.length > 0) {
-        items.push(['outlook', `Outlook (${outlookAccounts.length} 账户)`])
-      }
-      items.push(['gptmail', 'GptMail'], ['npcmail', 'NpcMail'], ['yydsmail', 'YYDSMail'])
-      setOpts(items)
+    Promise.all([
+      api.getSettings(),
+      api.getOutlookStats().catch(() => null),
+    ]).then(([settings, outlookStats]) => {
+      setOpts(buildDashboardProviderOptions(settings, { outlookStats }))
     }).catch(() => {})
   }, [])
   return opts
@@ -189,4 +172,3 @@ export function Dashboard() {
     </div>
   )
 }
-
