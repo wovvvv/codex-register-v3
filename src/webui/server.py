@@ -22,10 +22,18 @@ import src.db as db_mod
 import src.accounts as accounts_mod
 import src.proxy_pool as proxy_pool_mod
 import src.settings_db as settings_db
+import src.integrations.cli_proxy_monitor as cli_proxy_monitor_mod
+from src.integrations.cli_proxy import upload_account_to_cli_proxy
+from src.integrations.sub2api import upload_account_to_sub2api
 from src.mail import get_mail_client
-from src.mail.imap import IMAPMailClient
+from src.mail.imap import (
+    build_imap_client_from_provider,
+    is_provider_based_imap_config,
+    parse_imap_selector,
+)
 from src.mail.outlook import OutlookMailClient
 from src.browser.register import register_one
+from src.post_register import persist_account_and_maybe_upload
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -45,17 +53,34 @@ app = FastAPI(title="ChatGPT Register WebUI", docs_url=None, redoc_url=None, lif
 # ── Job registry ──────────────────────────────────────────────────────────
 
 class _Job:
-    def __init__(self, job_id: str, count: int, provider: str, engine: str, proxy_mode: str):
+    def __init__(
+        self,
+        job_id: str,
+        count: int,
+        provider: str,
+        engine: str,
+        proxy_mode: str,
+        upload_provider: str = "",
+        sub2api_upload: Optional[dict[str, Any]] = None,
+    ):
         self.id         = job_id
         self.count      = count
         self.provider   = provider
         self.engine     = engine
         self.proxy_mode = proxy_mode
+        self.upload_provider = upload_provider
+        self.sub2api_upload = dict(sub2api_upload or {})
         self.status     = "running"
         self.logs: list[str] = []
         self.results: list[dict] = []
         self.started    = time.time()
+        self.finished: Optional[float] = None
         self.task: Optional[asyncio.Task] = None
+
+    def set_status(self, status: str) -> None:
+        self.status = status
+        if status != "running" and self.finished is None:
+            self.finished = time.time()
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -69,17 +94,93 @@ class _Job:
             "engine":    self.engine,
             "status":    self.status,
             "started":   self.started,
+            "finished":  self.finished,
             "log_count": len(self.logs),
             "done":      len(self.results),
             "success":   sum(1 for r in self.results if r.get("status") == "注册完成"),
+            "upload_provider": self.upload_provider,
         }
         if full:
             d["logs"]    = self.logs
             d["results"] = self.results
+            d["sub2api_upload"] = self.sub2api_upload
         return d
 
 
 _jobs: dict[str, _Job] = {}
+
+
+def _normalize_email(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _select_outlook_accounts(
+    provider: str,
+    configured_accounts: list[dict],
+    token_emails: Optional[set[str]] = None,
+) -> list[dict]:
+    provider_lower = str(provider or "").strip().lower()
+    accounts = [acc for acc in (configured_accounts or []) if isinstance(acc, dict)]
+
+    if provider_lower == "outlook-imap":
+        return [
+            acc for acc in accounts
+            if str(acc.get("fetch_method", "graph")).strip().lower() == "imap"
+        ]
+
+    if provider_lower == "outlook-graph":
+        return [
+            acc for acc in accounts
+            if str(acc.get("fetch_method", "graph")).strip().lower() == "graph"
+        ]
+
+    if provider_lower != "outlook:no-token":
+        return accounts
+
+    used = {
+        _normalize_email(email)
+        for email in (token_emails or set())
+        if _normalize_email(email)
+    }
+    return [
+        acc for acc in accounts
+        if (_normalize_email(acc.get("email")) and _normalize_email(acc.get("email")) not in used)
+    ]
+
+
+def _parse_outlook_provider_selector(provider: str) -> tuple[str, Optional[int]]:
+    provider_lower = str(provider or "").strip().lower()
+    if ":" not in provider_lower:
+        return provider_lower, None
+
+    family, suffix = provider_lower.split(":", 1)
+    if suffix.isdigit():
+        return family, int(suffix)
+
+    return provider_lower, None
+
+
+def _build_outlook_rotation_stats(
+    configured_accounts: list[dict],
+    token_emails: Optional[set[str]] = None,
+) -> dict[str, int]:
+    configured = [
+        _normalize_email((acc or {}).get("email"))
+        for acc in (configured_accounts or [])
+        if isinstance(acc, dict)
+    ]
+    configured = [email for email in configured if email]
+    used = {
+        _normalize_email(email)
+        for email in (token_emails or set())
+        if _normalize_email(email)
+    }
+    with_token = sum(1 for email in configured if email in used)
+    return {
+        "configured": len(configured),
+        "with_token": with_token,
+        "without_token": max(0, len(configured) - with_token),
+    }
 
 
 # ── Background runner ─────────────────────────────────────────────────────
@@ -88,6 +189,11 @@ async def _run_job(job: _Job) -> None:
     try:
         cfg = await settings_db.build_config()
         cfg["engine"] = job.engine
+        if job.upload_provider:
+            cfg["upload_provider"] = job.upload_provider
+        merged_sub2api_upload = dict(cfg.get("sub2api_upload", {}) if isinstance(cfg.get("sub2api_upload"), dict) else {})
+        merged_sub2api_upload.update(job.sub2api_upload or {})
+        cfg["sub2api_upload"] = merged_sub2api_upload
 
         strategy     = cfg.get("proxy_strategy", "none")
         static_proxy = cfg.get("proxy_static") or None
@@ -98,10 +204,22 @@ async def _run_job(job: _Job) -> None:
         out_raw  = (cfg.get("mail") or {}).get("outlook", [])
 
         # Detect new IMAP format: provider objects with "accounts" sub-list
-        _is_new_imap = bool(imap_raw) and isinstance(imap_raw[0], dict) and "accounts" in imap_raw[0]
+        _is_new_imap = is_provider_based_imap_config(imap_raw)
         provider_lower = job.provider.lower()
         _is_imap_provider = provider_lower.startswith("imap:") and _is_new_imap
         _is_outlook       = provider_lower.startswith("outlook")
+        _outlook_accounts: list[dict] = []
+        _outlook_family = "outlook"
+        _outlook_fixed_index: Optional[int] = None
+
+        if _is_outlook:
+            _outlook_family, _outlook_fixed_index = _parse_outlook_provider_selector(job.provider)
+            token_emails = (
+                await accounts_mod.get_emails_with_access_token()
+                if _outlook_family == "outlook:no-token"
+                else None
+            )
+            _outlook_accounts = _select_outlook_accounts(_outlook_family, out_raw, token_emails)
 
         # Build shared client for API providers and old-format IMAP
         _shared_client = None
@@ -114,55 +232,47 @@ async def _run_job(job: _Job) -> None:
 
         def _get_mail_client(n: int, proxy: Optional[str] = None):
             if _is_imap_provider:
-                _parts = job.provider.split(":")
-                provider_idx = int(_parts[1])
+                provider_idx, account_idx = parse_imap_selector(job.provider)
+                if provider_idx is None:
+                    raise ValueError(f"IMAP provider selector 无效: {job.provider}")
                 if provider_idx >= len(imap_raw):
                     raise ValueError(f"IMAP 服务商索引 {provider_idx} 不存在（共 {len(imap_raw)} 个）")
                 prov     = imap_raw[provider_idx]
-                accounts = prov.get("accounts", [])
+                accounts = [a for a in (prov.get("accounts", []) or []) if a.get("email")]
                 if not accounts:
                     raise ValueError(f"IMAP 服务商 {provider_idx} ({prov.get('name','?')}) 没有配置账户")
 
                 # imap:N:M → fixed account M within provider N; imap:N → rotate
-                if len(_parts) >= 3 and _parts[2].isdigit():
-                    acc_idx = int(_parts[2])
-                    if acc_idx >= len(accounts):
+                if account_idx is not None:
+                    if account_idx >= len(accounts):
                         raise ValueError(
-                            f"IMAP 服务商 {provider_idx} 账户索引 {acc_idx} 不存在"
+                            f"IMAP 服务商 {provider_idx} 账户索引 {account_idx} 不存在"
                             f"（共 {len(accounts)} 个账户）"
                         )
-                    acc = accounts[acc_idx]
+                    acc = accounts[account_idx]
                 else:
                     acc = accounts[(n - 1) % len(accounts)]
 
-                auth_type = prov.get("auth_type", "password")
-                cred      = acc.get("credential", "")
-                return IMAPMailClient(
-                    email        = acc.get("email", ""),
-                    password     = cred if auth_type == "password" else "",
-                    host         = prov.get("host", ""),
-                    port         = int(prov.get("port", 993)),
-                    ssl          = bool(prov.get("ssl", True)),
-                    folder       = prov.get("folder", "INBOX"),
-                    use_alias    = prov.get("use_alias"),
-                    auth_type    = auth_type,
-                    access_token = cred if auth_type == "oauth2" else "",
-                )
+                return build_imap_client_from_provider(prov, acc, provider_idx)
             elif _is_outlook:
-                if not out_raw:
+                if not _outlook_accounts:
+                    if _outlook_family == "outlook-imap":
+                        raise ValueError("没有配置 fetch_method=imap 的 Outlook 账户")
+                    if _outlook_family == "outlook-graph":
+                        raise ValueError("没有配置 fetch_method=graph 的 Outlook 账户")
+                    if _outlook_family == "outlook:no-token":
+                        raise ValueError("没有未获取 Access Token 的 Outlook 账户")
                     raise ValueError("没有配置 Outlook 账户")
 
                 # outlook:N → fixed account N; outlook → rotate through all
-                _parts = job.provider.lower().split(":")
-                if len(_parts) >= 2 and _parts[1].isdigit():
-                    out_idx = int(_parts[1])
-                    if out_idx >= len(out_raw):
+                if _outlook_fixed_index is not None:
+                    if _outlook_fixed_index >= len(_outlook_accounts):
                         raise ValueError(
-                            f"Outlook 账户索引 {out_idx} 不存在（共 {len(out_raw)} 个）"
+                            f"Outlook 账户索引 {_outlook_fixed_index} 不存在（共 {len(_outlook_accounts)} 个）"
                         )
-                    acc = out_raw[out_idx]
+                    acc = _outlook_accounts[_outlook_fixed_index]
                 else:
-                    acc = out_raw[(n - 1) % len(out_raw)]
+                    acc = _outlook_accounts[(n - 1) % len(_outlook_accounts)]
 
                 return OutlookMailClient(
                     email         = acc.get("email", ""),
@@ -206,7 +316,11 @@ async def _run_job(job: _Job) -> None:
                         proxy     = proxy,
                         log_fn    = lambda msg, _n=n: job.log(f"[任务{_n}] {msg}"),
                     )
-                    await accounts_mod.upsert(result)
+                    result = await persist_account_and_maybe_upload(
+                        result,
+                        cfg,
+                        log_fn=job.log,
+                    )
                     job.results.append(result)
                     st = result.get("status", "?")
                     job.log(f"Task {n}/{job.count} → {result.get('email', '?')} [{st}]")
@@ -223,14 +337,14 @@ async def _run_job(job: _Job) -> None:
             return_exceptions=True,
         )
         if job.status != "cancelled":
-            job.status = "done"
+            job.set_status("done")
         d = job.to_dict()
         job.log(f"全部完成 — {d['success']}/{job.count} 成功")
     except asyncio.CancelledError:
-        job.status = "cancelled"
+        job.set_status("cancelled")
         job.log("任务已被用户取消")
     except Exception as exc:
-        job.status = "error"
+        job.set_status("error")
         job.log(f"Fatal: {exc}")
         logger.exception(f"[webui] Job {job.id} fatal")
 
@@ -465,6 +579,13 @@ async def api_import_outlook_save(request: Request):
     return {"added": len(added), "total": len(existing) + len(added)}
 
 
+@app.get("/api/mail/outlook/stats")
+async def api_outlook_stats():
+    configured = await settings_db.get_section("mail.outlook")
+    token_emails = await accounts_mod.get_emails_with_access_token()
+    return _build_outlook_rotation_stats(configured, token_emails)
+
+
 # ── Accounts API ──────────────────────────────────────────────────────────
 
 @app.get("/api/accounts")
@@ -521,11 +642,187 @@ async def api_export(fmt: str = "json"):
             media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=accounts.csv"},
         )
+    content, count = accounts_mod.build_cpa_export_zip_bytes(rows)
     return Response(
-        content=json.dumps(rows, ensure_ascii=False, indent=2),
-        media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=accounts.json"},
+        content=content,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename=accounts.zip",
+            "X-Exported-Count": str(count),
+        },
     )
+
+
+@app.post("/api/accounts/export-token-zip")
+async def api_export_token_zip(request: Request):
+    body: dict = await request.json()
+    emails = [
+        str(email or "").strip()
+        for email in body.get("emails", [])
+        if str(email or "").strip()
+    ]
+    select_all = bool(body.get("select_all", False))
+    status_filter = str(body.get("status", "") or "")
+
+    rows = await accounts_mod.list_all(status_filter or None if select_all else None)
+    if not select_all and emails:
+        selected = set(emails)
+        rows = [row for row in rows if row.get("email") in selected]
+
+    content, count = accounts_mod.build_cpa_export_zip_bytes(rows)
+    return Response(
+        content=content,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": "attachment; filename=accounts.zip",
+            "X-Exported-Count": str(count),
+        },
+    )
+
+
+@app.post("/api/cli-proxy/upload")
+async def api_cli_proxy_upload(request: Request):
+    """手动上传单个账号到 CLI Proxy。"""
+    body: dict = await request.json()
+    email = str(body.get("email", "") or "").strip()
+    if not email:
+        raise HTTPException(400, "email required")
+
+    cfg = await settings_db.build_config()
+    account = await accounts_mod.get_by_email(email)
+    if not account:
+        raise HTTPException(404, f"账号未找到：{email}")
+
+    target = body.get("target")
+    ok, message = await upload_account_to_cli_proxy(account, cfg, target_override=target)
+    return {
+        "ok": ok,
+        "email": email,
+        "target": target or cfg.get("cli_proxy", {}).get("target", ""),
+        "message": message,
+    }
+
+
+@app.post("/api/cli-proxy/upload-batch")
+async def api_cli_proxy_upload_batch(request: Request):
+    """批量上传多个账号到 CLI Proxy。"""
+    body: dict = await request.json()
+    emails = body.get("emails", [])
+    if not isinstance(emails, list) or not emails:
+        raise HTTPException(400, "emails required")
+
+    cfg = await settings_db.build_config()
+    target = body.get("target")
+    results: list[dict[str, Any]] = []
+
+    for raw_email in emails:
+        email = str(raw_email or "").strip()
+        if not email:
+            results.append({"email": "", "ok": False, "message": "email 不能为空"})
+            continue
+
+        account = await accounts_mod.get_by_email(email)
+        if not account:
+            results.append({"email": email, "ok": False, "message": "账号未找到"})
+            continue
+
+        ok, message = await upload_account_to_cli_proxy(account, cfg, target_override=target)
+        results.append({"email": email, "ok": ok, "message": message})
+
+    success = sum(1 for item in results if item.get("ok"))
+    failed = len(results) - success
+    return {
+        "ok": failed == 0,
+        "target": target or cfg.get("cli_proxy", {}).get("target", ""),
+        "total": len(results),
+        "success": success,
+        "failed": failed,
+        "results": results,
+    }
+
+
+@app.post("/api/sub2api/upload")
+async def api_sub2api_upload(request: Request):
+    """手动上传单个账号到 Sub2API。"""
+    body: dict = await request.json()
+    email = str(body.get("email", "") or "").strip()
+    if not email:
+        raise HTTPException(400, "email required")
+
+    cfg = await settings_db.build_config()
+    account = await accounts_mod.get_by_email(email)
+    if not account:
+        raise HTTPException(404, f"账号未找到：{email}")
+
+    ok, message = await upload_account_to_sub2api(account, cfg)
+    return {
+        "ok": ok,
+        "email": email,
+        "target": cfg.get("sub2api_upload", {}).get("base_url", ""),
+        "message": message,
+    }
+
+
+@app.post("/api/sub2api/upload-batch")
+async def api_sub2api_upload_batch(request: Request):
+    """批量上传多个账号到 Sub2API。"""
+    body: dict = await request.json()
+    emails = body.get("emails", [])
+    if not isinstance(emails, list) or not emails:
+        raise HTTPException(400, "emails required")
+
+    cfg = await settings_db.build_config()
+    results: list[dict[str, Any]] = []
+
+    for raw_email in emails:
+        email = str(raw_email or "").strip()
+        if not email:
+            results.append({"email": "", "ok": False, "message": "email 不能为空"})
+            continue
+
+        account = await accounts_mod.get_by_email(email)
+        if not account:
+            results.append({"email": email, "ok": False, "message": "账号未找到"})
+            continue
+
+        ok, message = await upload_account_to_sub2api(account, cfg)
+        results.append({"email": email, "ok": ok, "message": message})
+
+    success = sum(1 for item in results if item.get("ok"))
+    failed = len(results) - success
+    return {
+        "ok": failed == 0,
+        "target": cfg.get("sub2api_upload", {}).get("base_url", ""),
+        "total": len(results),
+        "success": success,
+        "failed": failed,
+        "results": results,
+    }
+
+
+@app.get("/api/cli-proxy/monitor/status")
+async def api_cli_proxy_monitor_status():
+    return await cli_proxy_monitor_mod.monitor_manager.get_status()
+
+
+@app.post("/api/cli-proxy/monitor/start")
+async def api_cli_proxy_monitor_start():
+    return await cli_proxy_monitor_mod.monitor_manager.start()
+
+
+@app.post("/api/cli-proxy/monitor/stop")
+async def api_cli_proxy_monitor_stop():
+    return await cli_proxy_monitor_mod.monitor_manager.stop()
+
+
+@app.post("/api/cli-proxy/monitor/run-once")
+async def api_cli_proxy_monitor_run_once():
+    return await cli_proxy_monitor_mod.monitor_manager.run_once()
+
+
+@app.get("/api/cli-proxy/monitor/history")
+async def api_cli_proxy_monitor_history(limit: int = 100):
+    return {"items": await cli_proxy_monitor_mod.monitor_manager.get_history(limit)}
 
 
 # ── Jobs API ──────────────────────────────────────────────────────────────
@@ -537,9 +834,22 @@ async def api_start_job(request: Request):
     count    = int(body.get("count", 1))
     provider = body.get("provider") or cfg.get("mail_provider", "gptmail")
     engine   = body.get("engine")   or cfg.get("engine", "playwright")
+    upload_provider = str(body.get("upload_provider") or cfg.get("upload_provider", "none") or "none").strip().lower()
+    if upload_provider not in {"none", "cpa", "sub2api"}:
+        upload_provider = "none"
+    raw_sub2api_upload = body.get("sub2api_upload")
+    sub2api_upload = raw_sub2api_upload if isinstance(raw_sub2api_upload, dict) else {}
 
     job_id = str(uuid.uuid4())[:8]
-    job = _Job(job_id, count, provider, engine, cfg.get("proxy_strategy", "none"))
+    job = _Job(
+        job_id,
+        count,
+        provider,
+        engine,
+        cfg.get("proxy_strategy", "none"),
+        upload_provider=upload_provider,
+        sub2api_upload=sub2api_upload,
+    )
     _jobs[job_id] = job
     job.task = asyncio.create_task(_run_job(job))
     return {"job_id": job_id}
@@ -572,7 +882,7 @@ async def api_cancel_job(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    job.status = "cancelled"
+    job.set_status("cancelled")
     if job.task and not job.task.done():
         job.task.cancel()
     job.log("⛔ 用户取消了任务")
@@ -593,7 +903,7 @@ async def api_batch_jobs_action(request: Request):
         if action == "cancel":
             job = _jobs.get(job_id)
             if job and job.status == "running":
-                job.status = "cancelled"
+                job.set_status("cancelled")
                 if job.task and not job.task.done():
                     job.task.cancel()
                 job.log("⛔ 用户批量取消")
