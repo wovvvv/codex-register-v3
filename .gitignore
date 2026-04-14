@@ -1,0 +1,7 @@
+# 运行时数据与构建产物不进入版本控制。
+accounts.db
+register.log
+data/
+src/webui/static/
+webui_frontend/node_modules/
+.worktrees/
