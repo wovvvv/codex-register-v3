@@ -55,11 +55,11 @@ test('现有 IMAP / Outlook provider 选项仍存在', () => {
   }
 })
 
-test('Outlook 拆分 provider family：Settings 不含 no-token，Dashboard/Jobs 暴露 mixed+imap+graph', () => {
+test('Outlook 拆分 provider family：fetch_method 按 trim+lowercase 归类，legacy 缺省归入 graph', () => {
   const sample = {
     'mail.outlook': [
-      { email: 'imap1@x.com', fetch_method: 'imap' },
-      { email: 'graph1@x.com', fetch_method: 'graph' },
+      { email: 'imap1@x.com', fetch_method: ' IMAP ' },
+      { email: 'graph1@x.com', fetch_method: ' graph ' },
       { email: 'graph2@x.com' },
     ],
   }
@@ -75,6 +75,8 @@ test('Outlook 拆分 provider family：Settings 不含 no-token，Dashboard/Jobs
   assert.equal(dashboardOpts.some(([value]) => value === 'outlook'), true)
   assert.equal(dashboardOpts.some(([value]) => value === 'outlook-imap'), true)
   assert.equal(dashboardOpts.some(([value]) => value === 'outlook-graph'), true)
+  assert.equal(dashboardOpts.find(([value]) => value === 'outlook-imap')?.[1], 'Outlook IMAP（1 账户轮换）')
+  assert.equal(dashboardOpts.find(([value]) => value === 'outlook-graph')?.[1], 'Outlook Graph（2 账户轮换）')
 
   assert.equal(jobsOpts.some(([value]) => value === 'outlook'), true)
   assert.equal(jobsOpts.some(([value]) => value === 'outlook-imap'), true)
@@ -84,8 +86,8 @@ test('Outlook 拆分 provider family：Settings 不含 no-token，Dashboard/Jobs
 test('Jobs 包含 mixed/filter fixed selectors，且 Outlook fixed 标签带 IMAP/Graph 前缀', () => {
   const sample = {
     'mail.outlook': [
-      { email: 'imap1@x.com', fetch_method: 'imap' },
-      { email: 'graph1@x.com', fetch_method: 'graph' },
+      { email: 'imap1@x.com', fetch_method: ' IMAP ' },
+      { email: 'graph1@x.com', fetch_method: ' graph ' },
       { email: 'graph2@x.com' },
     ],
   }
@@ -99,4 +101,33 @@ test('Jobs 包含 mixed/filter fixed selectors，且 Outlook fixed 标签带 IMA
   assert.equal(jobsOpts.find(([value]) => value === 'outlook-imap:0')?.[1], '└ IMAP: imap1@x.com')
   assert.equal(jobsOpts.find(([value]) => value === 'outlook-graph:0')?.[1], '└ Graph: graph1@x.com')
   assert.equal(jobsOpts.find(([value]) => value === 'outlook-graph:1')?.[1], '└ Graph: graph2@x.com')
+})
+
+test('Dashboard/Jobs 不暴露空的 Outlook split provider family', () => {
+  const graphOnlySample = {
+    'mail.outlook': [
+      { email: 'legacy@x.com' },
+      { email: 'graph1@x.com', fetch_method: ' Graph ' },
+    ],
+  }
+  const imapOnlySample = {
+    'mail.outlook': [
+      { email: 'imap1@x.com', fetch_method: ' IMAP ' },
+    ],
+  }
+
+  const graphOnlyDashboardOpts = buildDashboardProviderOptions(graphOnlySample)
+  const graphOnlyJobsOpts = buildJobsProviderOptions(graphOnlySample)
+  const imapOnlyDashboardOpts = buildDashboardProviderOptions(imapOnlySample)
+  const imapOnlyJobsOpts = buildJobsProviderOptions(imapOnlySample)
+
+  assert.equal(graphOnlyDashboardOpts.some(([value]) => value === 'outlook-imap'), false)
+  assert.equal(graphOnlyJobsOpts.some(([value]) => value === 'outlook-imap'), false)
+  assert.equal(graphOnlyJobsOpts.some(([value]) => value === 'outlook-imap:0'), false)
+  assert.equal(graphOnlyDashboardOpts.some(([value]) => value === 'outlook-graph'), true)
+
+  assert.equal(imapOnlyDashboardOpts.some(([value]) => value === 'outlook-graph'), false)
+  assert.equal(imapOnlyJobsOpts.some(([value]) => value === 'outlook-graph'), false)
+  assert.equal(imapOnlyJobsOpts.some(([value]) => value === 'outlook-graph:0'), false)
+  assert.equal(imapOnlyDashboardOpts.some(([value]) => value === 'outlook-imap'), true)
 })

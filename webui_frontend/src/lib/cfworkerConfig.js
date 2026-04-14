@@ -51,6 +51,11 @@ function normalizeDomain(value) {
   return normalizeString(value).toLowerCase()
 }
 
+function normalizeOutlookFetchMethod(value) {
+  const source = value === undefined ? 'graph' : value
+  return String(source).trim().toLowerCase()
+}
+
 export function normalizeDomainList(value) {
   const list = Array.isArray(value)
     ? value
@@ -101,11 +106,11 @@ export function serializeCfworkerConfig(raw) {
 }
 
 function isOutlookImapAccount(account) {
-  return account?.fetch_method === 'imap'
+  return normalizeOutlookFetchMethod(account?.fetch_method) === 'imap'
 }
 
 function isOutlookGraphAccount(account) {
-  return (account?.fetch_method || 'graph') === 'graph'
+  return normalizeOutlookFetchMethod(account?.fetch_method) === 'graph'
 }
 
 function buildOutlookAccountLabel(account, index) {
@@ -150,29 +155,29 @@ function buildProviderOptions(settings = {}, mode = 'settings') {
     const outlookImapAccounts = outlookAccounts.filter((acc) => isOutlookImapAccount(acc))
     const outlookGraphAccounts = outlookAccounts.filter((acc) => isOutlookGraphAccount(acc))
 
-    if (mode === 'dashboard') {
-      items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
-      items.push(['outlook-imap', `Outlook IMAP（${outlookImapAccounts.length} 账户轮换）`])
-      items.push(['outlook-graph', `Outlook Graph（${outlookGraphAccounts.length} 账户轮换）`])
-    } else {
-      items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
-      if (mode !== 'settings') {
+    items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
+
+    if (mode !== 'settings') {
+      if (outlookImapAccounts.length > 0) {
         items.push(['outlook-imap', `Outlook IMAP（${outlookImapAccounts.length} 账户轮换）`])
+      }
+      if (outlookGraphAccounts.length > 0) {
         items.push(['outlook-graph', `Outlook Graph（${outlookGraphAccounts.length} 账户轮换）`])
       }
-      if (mode !== 'dashboard') {
-        outlookAccounts.forEach((acc, i) => {
-          items.push([`outlook:${i}`, buildOutlookAccountLabel(acc, i)])
-        })
-        outlookImapAccounts.forEach((acc, i) => {
-          const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
-          items.push([`outlook-imap:${i}`, `└ IMAP: ${email}`])
-        })
-        outlookGraphAccounts.forEach((acc, i) => {
-          const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
-          items.push([`outlook-graph:${i}`, `└ Graph: ${email}`])
-        })
-      }
+    }
+
+    if (mode === 'jobs') {
+      outlookAccounts.forEach((acc, i) => {
+        items.push([`outlook:${i}`, buildOutlookAccountLabel(acc, i)])
+      })
+      outlookImapAccounts.forEach((acc, i) => {
+        const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
+        items.push([`outlook-imap:${i}`, `└ IMAP: ${email}`])
+      })
+      outlookGraphAccounts.forEach((acc, i) => {
+        const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
+        items.push([`outlook-graph:${i}`, `└ Graph: ${email}`])
+      })
     }
   }
 
