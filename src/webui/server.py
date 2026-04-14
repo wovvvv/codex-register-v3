@@ -150,12 +150,17 @@ def _select_outlook_accounts(
 
 def _parse_outlook_provider_selector(provider: str) -> tuple[str, Optional[int]]:
     provider_lower = str(provider or "").strip().lower()
+    if provider_lower == "outlook:no-token":
+        return provider_lower, None
+
     if ":" not in provider_lower:
         return provider_lower, None
 
     family, suffix = provider_lower.split(":", 1)
-    if suffix.isdigit():
-        return family, int(suffix)
+    if family in {"outlook", "outlook-imap", "outlook-graph"}:
+        if suffix.isdigit():
+            return family, int(suffix)
+        raise ValueError(f"Outlook provider selector 无效: {provider}")
 
     return provider_lower, None
 

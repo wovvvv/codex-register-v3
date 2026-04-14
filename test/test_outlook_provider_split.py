@@ -1,11 +1,12 @@
 """Outlook provider split helper tests."""
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 def _install_test_stubs() -> None:
@@ -219,6 +220,72 @@ class OutlookProviderSplitTests(unittest.TestCase):
 
         self.assertEqual(family, "outlook-imap")
         self.assertEqual(fixed_index, 1)
+
+    def test_parse_outlook_provider_selector_rejects_malformed_split_suffix(self):
+        web_server = self._import_server()
+
+        with self.assertRaisesRegex(ValueError, "Outlook provider selector 无效"):
+            web_server._parse_outlook_provider_selector("outlook-imap:bad")
+
+    def test_run_job_applies_filtered_index_for_outlook_graph_selector(self):
+        web_server = self._import_server()
+        job = web_server._Job("job-graph-index", 1, "outlook-graph:1", "playwright", "none")
+        captured_mail_clients = []
+
+        async def _fake_register_one(*_args, **kwargs):
+            captured_mail_clients.append(kwargs.get("mail_client"))
+            return {"email": "ok@example.com", "status": "注册完成"}
+
+        async def _fake_build_config():
+            return {
+                "proxy_strategy": "none",
+                "max_concurrent": 1,
+                "mail": {
+                    "imap": [],
+                    "outlook": [
+                        {"email": "imap-a@example.com", "fetch_method": "imap"},
+                        {"email": "graph-a@example.com", "fetch_method": "graph"},
+                        {"email": "imap-b@example.com", "fetch_method": "imap"},
+                        {"email": "graph-b@example.com", "fetch_method": "graph"},
+                    ],
+                },
+            }
+
+        with patch("src.webui.server.settings_db.build_config", new=AsyncMock(side_effect=_fake_build_config)), \
+             patch("src.webui.server.register_one", new=AsyncMock(side_effect=_fake_register_one)), \
+             patch("src.webui.server.persist_account_and_maybe_upload", new=AsyncMock(side_effect=lambda result, *_args, **_kwargs: result)), \
+             patch("src.webui.server.OutlookMailClient", side_effect=lambda **kwargs: kwargs):
+            asyncio.run(web_server._run_job(job))
+
+        self.assertEqual(job.status, "done")
+        self.assertEqual(len(captured_mail_clients), 1)
+        self.assertEqual(captured_mail_clients[0]["email"], "graph-b@example.com")
+        self.assertEqual(captured_mail_clients[0]["fetch_method"], "graph")
+
+    def test_run_job_reports_empty_filtered_outlook_imap_pool(self):
+        web_server = self._import_server()
+        job = web_server._Job("job-imap-empty", 1, "outlook-imap", "playwright", "none")
+
+        async def _fake_build_config():
+            return {
+                "proxy_strategy": "none",
+                "max_concurrent": 1,
+                "mail": {
+                    "imap": [],
+                    "outlook": [
+                        {"email": "graph-a@example.com", "fetch_method": "graph"},
+                    ],
+                },
+            }
+
+        with patch("src.webui.server.settings_db.build_config", new=AsyncMock(side_effect=_fake_build_config)):
+            asyncio.run(web_server._run_job(job))
+
+        self.assertEqual(job.status, "done")
+        self.assertTrue(
+            any("没有配置 fetch_method=imap 的 Outlook 账户" in line for line in job.logs),
+            msg=f"logs did not include expected empty filtered-pool error: {job.logs}",
+        )
 
 
 if __name__ == "__main__":
