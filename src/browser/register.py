@@ -439,7 +439,14 @@ async def _maybe_acquire_oauth_tokens(
         return False
 
     try:
-        from src.browser.oauth import acquire_tokens_via_browser
+        import src.browser.oauth as oauth_mod
+
+        acquire_tokens_via_browser = oauth_mod.acquire_tokens_via_browser
+        oauth_phone_required_error = getattr(
+            oauth_mod,
+            "OAuthPhoneRequiredError",
+            RuntimeError,
+        )
 
         oauth_password = str(account.get("password", "") or "")
         if prefer_existing_password:
@@ -479,6 +486,12 @@ async def _maybe_acquire_oauth_tokens(
         )
         if log_fn:
             log_fn("[OAuth] ⚠️ 令牌获取失败，注册结果已保存（无令牌）")
+        return False
+    except oauth_phone_required_error as exc:
+        account["oauth_blocked_reason"] = "phone_required"
+        logger.warning(f"[{task_id}] OAuth blocked by phone gate: {exc}")
+        if log_fn:
+            log_fn("[OAuth] ⚠️ 账号被要求绑定手机号，无法自动获取令牌")
         return False
     except Exception as exc:
         logger.warning(f"[{task_id}] OAuth step error (non-fatal): {exc}")

@@ -154,6 +154,37 @@ async def get_emails_with_access_token() -> set[str]:
     }
 
 
+async def get_emails_with_oauth_blocked_reason(reason: str) -> set[str]:
+    """Return normalized emails whose raw_json records a given OAuth block reason."""
+    target = str(reason or "").strip().lower()
+    if not target:
+        return set()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT email, raw_json
+            FROM accounts
+            WHERE TRIM(COALESCE(raw_json, '')) != ''
+            """
+        )
+        rows = await cur.fetchall()
+
+    blocked: set[str] = set()
+    for row in rows:
+        email = str(row["email"] or "").strip().lower()
+        if not email:
+            continue
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if str(raw.get("oauth_blocked_reason", "") or "").strip().lower() == target:
+            blocked.add(email)
+    return blocked
+
+
 # ──────────────────────────────────────────────
 # Import / Export
 # ──────────────────────────────────────────────

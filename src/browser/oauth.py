@@ -68,6 +68,13 @@ _FLOW_SELECTORS: list[str] = [
 
 # Keep the old name for backwards compatibility (used in unit tests / imports)
 _CONSENT_SELECTORS = _FLOW_SELECTORS
+_PHONE_REQUIRED_KEYWORDS = (
+    "phone number required",
+    "please add a phone number",
+    "verify your phone number",
+    "add a phone number",
+)
+_PHONE_GATE_GRACE_SECONDS = 30.0
 
 
 # ── Token result model ───────────────────────────────────────────────────────
@@ -115,6 +122,10 @@ class TokenResult:
             "expired":       self.expires_at,
             "last_refresh":  now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         }
+
+
+class OAuthPhoneRequiredError(RuntimeError):
+    """Raised when Auth0 blocks OAuth completion behind phone verification."""
 
 
 # ── PKCE helpers ─────────────────────────────────────────────────────────────
@@ -187,6 +198,18 @@ async def _switch_to_passwordless_otp(page: Page) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _oauth_add_phone_required(page: Page) -> bool:
+    """Return True when the current OAuth page is the mandatory add-phone gate."""
+    url = (page.url or "").lower()
+    if "add-phone" not in url:
+        return False
+    try:
+        text: str = await page.evaluate("() => (document.body?.innerText || '').toLowerCase()")
+    except Exception:
+        text = ""
+    return any(keyword in text for keyword in _PHONE_REQUIRED_KEYWORDS)
 
 
 def _extract_code(url: str) -> Optional[str]:
@@ -436,6 +459,7 @@ async def acquire_tokens_via_browser(
                 return await _exchange_code(captured[0], verifier, email, proxy, _to)
 
             # ── Handle consent / about-you / workspace pages ─────────────
+            phone_gate_started_at: float | None = None
             for attempt in range(1, 8):
                 _sync_capture_from_url()
                 if captured:
@@ -443,6 +467,23 @@ async def acquire_tokens_via_browser(
                     if log_fn:
                         log_fn("[OAuth] 授权码已获取，正在交换令牌…")
                     return await _exchange_code(captured[0], verifier, email, proxy, _to)
+
+                if await _oauth_add_phone_required(oauth_page):
+                    now = asyncio.get_event_loop().time()
+                    if phone_gate_started_at is None:
+                        phone_gate_started_at = now
+                        logger.warning(
+                            f"[oauth] Phone gate detected for {email} at {oauth_page.url} "
+                            f"— waiting up to {_PHONE_GATE_GRACE_SECONDS:.0f}s for callback"
+                        )
+                        if log_fn:
+                            log_fn("[OAuth] ⚠️ 检测到手机号验证页，等待授权回跳…")
+                    elif now - phone_gate_started_at >= _PHONE_GATE_GRACE_SECONDS:
+                        raise OAuthPhoneRequiredError(
+                            f"Phone number required at {oauth_page.url}"
+                        )
+                else:
+                    phone_gate_started_at = None
 
                 logger.info(f"[oauth] Attempting OAuth flow click-through (try {attempt})")
 

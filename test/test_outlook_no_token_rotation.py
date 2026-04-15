@@ -220,6 +220,38 @@ class OutlookNoTokenRotationTests(unittest.TestCase):
 
         self.assertEqual([item["email"] for item in selected], ["todo@example.com"])
 
+    def test_select_outlook_accounts_excludes_phone_required_emails(self):
+        web_server = self._import_server()
+        configured = [
+            {"email": "todo@example.com"},
+            {"email": "blocked@example.com"},
+        ]
+
+        selected = web_server._select_outlook_accounts(
+            "outlook:no-token",
+            configured,
+            token_emails=set(),
+            blocked_emails={"blocked@example.com"},
+        )
+
+        self.assertEqual([item["email"] for item in selected], ["todo@example.com"])
+
+    def test_build_outlook_rotation_stats_excludes_phone_required_emails_from_remaining_pool(self):
+        web_server = self._import_server()
+        stats = web_server._build_outlook_rotation_stats(
+            [
+                {"email": "done@example.com"},
+                {"email": "todo@example.com"},
+                {"email": "blocked@example.com"},
+            ],
+            {"done@example.com"},
+            {"blocked@example.com"},
+        )
+
+        self.assertEqual(stats["configured"], 3)
+        self.assertEqual(stats["with_token"], 1)
+        self.assertEqual(stats["without_token"], 1)
+
     def test_job_records_finished_timestamp_when_marked_done(self):
         web_server = self._import_server()
         with patch("src.webui.server.time.time", side_effect=[100.0, 160.0]):
