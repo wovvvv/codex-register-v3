@@ -242,6 +242,75 @@ async def _click_signup_entrypoint(task_id: str, page: Page, signup_btn) -> None
     logger.debug(f"[{task_id}] After signup DOM click fallback: {page.url}")
 
 
+async def _email_submit_progressed(page: Page, before_url: str, timeout_ms: int = 2_500) -> bool:
+    """Return True when the email step has clearly advanced away from the entry page."""
+    if page.url != before_url:
+        return True
+
+    detected = await _wait_for_password_or_otp(page, timeout_ms=timeout_ms)
+    if detected != "none":
+        return True
+
+    try:
+        return not await _find_visible_email_input(page)
+    except Exception:
+        return False
+
+
+async def _submit_email_and_advance(task_id: str, page: Page, email_el, submit_loc) -> None:
+    """
+    Submit the email step, then quickly verify the page actually progressed.
+
+    Auth0 occasionally ignores the first synthetic click on the email step and
+    leaves the browser on ``/log-in-or-create-account``.  In that case retry
+    with a raw DOM click + Enter before declaring the password step missing.
+    """
+    before_url = page.url
+    submitted = False
+
+    if submit_loc:
+        await human_move_and_click(page, submit_loc)
+        submitted = True
+    else:
+        submitted = await click_submit_or_text(page, ["Continue", "继续", "Next", "Submit"])
+
+    if not submitted:
+        try:
+            await email_el.press("Enter")
+        except Exception:
+            pass
+
+    await jitter_sleep(1.0, 0.3)
+    if await _email_submit_progressed(page, before_url):
+        return
+
+    logger.warning(
+        f"[{task_id}] Email submit did not progress — falling back to DOM submit. "
+        f"URL={page.url}"
+    )
+    await dismiss_google_one_tap(page)
+    try:
+        await page.evaluate(
+            """
+            () => {
+                const btn = document.querySelector("button[type='submit'], input[type='submit']");
+                btn?.click();
+            }
+            """
+        )
+    except Exception as exc:
+        logger.debug(f"[{task_id}] Email DOM submit fallback failed: {exc}")
+
+    try:
+        await email_el.press("Enter")
+    except Exception:
+        pass
+
+    await jitter_sleep(1.5, 0.4)
+    await _assert_not_error(task_id, page)
+    logger.debug(f"[{task_id}] After email submit fallback: {page.url}")
+
+
 # ── Public entry-point ─────────────────────────────────────────────────────
 
 async def register_one(
@@ -603,15 +672,9 @@ async def _state_machine(
         pass
 
     if sub_loc:
-        await human_move_and_click(page, sub_loc)
-        submitted = True
+        await _submit_email_and_advance(task_id, page, email_el, sub_loc)
     else:
-        submitted = await click_submit_or_text(page, ["Continue", "继续", "Next", "Submit"])
-    if not submitted:
-        try:
-            await email_el.press("Enter")
-        except Exception:
-            pass
+        await _submit_email_and_advance(task_id, page, email_el, None)
 
     logger.debug(f"[{task_id}] Email submitted")
 
