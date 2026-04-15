@@ -322,61 +322,43 @@ async def register_one(
                 account["status"] = "注册完成"
                 logger.success(f"[{task_id}] ✅ Done: {email}")
 
-                # ── Post-registration: Codex OAuth token acquisition ──────────
-                # The browser still holds valid auth.openai.com cookies from the
-                # completed registration session.  Re-using the SAME page means
-                # Auth0 can skip re-authentication, and the fingerprint (desktop
-                # or mobile, depending on the top-level `mobile` config) is
-                # already set — no need for a separate mobile context.
-                if cfg.get("enable_oauth", True):
-                    try:
-                        from src.browser.oauth import acquire_tokens_via_browser
-                        if log_fn:
-                            log_fn("步骤 8/8: 获取 OAuth 访问令牌…")
-                        token = await acquire_tokens_via_browser(
-                            page=page,
-                            email=email,
-                            password=password,
-                            first_name=first_name,
-                            last_name=last_name,
-                            birthday=birthday,
-                            proxy=proxy,
-                            timeouts=timeouts,
-                            mail_client=mail_client,
-                            mobile=False,   # page already carries the correct fingerprint
-                            log_fn=log_fn,
-                        )
-                        if token:
-                            account.update(token.to_dict())
-                            logger.success(
-                                f"[{task_id}] 🔑 OAuth tokens acquired — "
-                                f"account_id={token.account_id} "
-                                f"expires={token.expires_at}"
-                            )
-                            if log_fn:
-                                log_fn(f"[OAuth] ✅ 令牌获取成功 account_id={token.account_id}")
-                        else:
-                            logger.warning(
-                                f"[{task_id}] OAuth step returned None — "
-                                "registration result saved without tokens"
-                            )
-                            if log_fn:
-                                log_fn("[OAuth] ⚠️ 令牌获取失败，注册结果已保存（无令牌）")
-                    except Exception as _oe:
-                        logger.warning(
-                            f"[{task_id}] OAuth step error (non-fatal): {_oe}"
-                        )
-                        if log_fn:
-                            log_fn(f"[OAuth] ⚠️ 令牌获取异常（非致命）: {_oe}")
+                await _maybe_acquire_oauth_tokens(
+                    task_id=task_id,
+                    cfg=cfg,
+                    page=page,
+                    account=account,
+                    proxy=proxy,
+                    timeouts=timeouts,
+                    mail_client=mail_client,
+                    mobile=False,
+                    log_fn=log_fn,
+                    step_label="步骤 8/8: 获取 OAuth 访问令牌…",
+                )
 
                 return account
 
             except EmailAlreadyRegisteredError as exc:
-                logger.warning(f"[{task_id}] ⚠️ 邮箱已注册，跳过: {account['email']}")
+                logger.warning(f"[{task_id}] ⚠️ 邮箱已注册，转为尝试获取 OAuth 令牌: {account['email']}")
                 if log_fn:
-                    log_fn(f"⚠️ 跳过：该邮箱已注册 ({account['email']})")
+                    log_fn(f"⚠️ 检测到该邮箱已注册，尝试直接获取 OAuth 令牌 ({account['email']})")
                 account["status"] = "already_registered"
                 account["error"] = str(exc)
+                acquired = await _maybe_acquire_oauth_tokens(
+                    task_id=task_id,
+                    cfg=cfg,
+                    page=page,
+                    account=account,
+                    proxy=proxy,
+                    timeouts=timeouts,
+                    mail_client=mail_client,
+                    mobile=False,
+                    log_fn=log_fn,
+                    step_label="步骤 5/5: 邮箱已注册，尝试获取 OAuth 访问令牌…",
+                    prefer_existing_password=True,
+                )
+                if acquired:
+                    account["status"] = "注册完成"
+                    account.pop("error", None)
                 return account
 
             # except SkipRegistrationError as exc:
@@ -419,8 +401,90 @@ async def register_one(
                     except Exception:
                         pass
 
-        account["status"] = "failed"
-        return account
+    account["status"] = "failed"
+    return account
+
+
+async def _load_existing_account_password(email: str) -> str:
+    """Best-effort lookup of a previously stored password for an existing account."""
+    try:
+        import src.accounts as accounts_mod
+
+        existing = await accounts_mod.get_by_email(email)
+    except Exception as exc:
+        logger.warning(f"[register] Failed to load existing account password for {email}: {exc}")
+        return ""
+
+    if not existing:
+        return ""
+    return str(existing.get("password", "") or "").strip()
+
+
+async def _maybe_acquire_oauth_tokens(
+    *,
+    task_id: str,
+    cfg: dict,
+    page: Page,
+    account: dict,
+    proxy: Optional[str],
+    timeouts: dict,
+    mail_client: MailClient,
+    mobile: bool,
+    log_fn=None,
+    step_label: str = "步骤 8/8: 获取 OAuth 访问令牌…",
+    prefer_existing_password: bool = False,
+) -> bool:
+    """Attempt non-fatal OAuth token acquisition, updating *account* in place."""
+    if not cfg.get("enable_oauth", True):
+        return False
+
+    try:
+        from src.browser.oauth import acquire_tokens_via_browser
+
+        oauth_password = str(account.get("password", "") or "")
+        if prefer_existing_password:
+            oauth_password = await _load_existing_account_password(str(account.get("email", "") or ""))
+            account["password"] = oauth_password
+
+        if log_fn:
+            log_fn(step_label)
+
+        token = await acquire_tokens_via_browser(
+            page=page,
+            email=str(account.get("email", "") or ""),
+            password=oauth_password,
+            first_name=str(account.get("firstName", "") or ""),
+            last_name=str(account.get("lastName", "") or ""),
+            birthday=account.get("birthday"),
+            proxy=proxy,
+            timeouts=timeouts,
+            mail_client=mail_client,
+            mobile=mobile,
+            log_fn=log_fn,
+        )
+        if token:
+            account.update(token.to_dict())
+            logger.success(
+                f"[{task_id}] 🔑 OAuth tokens acquired — "
+                f"account_id={token.account_id} "
+                f"expires={token.expires_at}"
+            )
+            if log_fn:
+                log_fn(f"[OAuth] ✅ 令牌获取成功 account_id={token.account_id}")
+            return True
+
+        logger.warning(
+            f"[{task_id}] OAuth step returned None — "
+            "registration result saved without tokens"
+        )
+        if log_fn:
+            log_fn("[OAuth] ⚠️ 令牌获取失败，注册结果已保存（无令牌）")
+        return False
+    except Exception as exc:
+        logger.warning(f"[{task_id}] OAuth step error (non-fatal): {exc}")
+        if log_fn:
+            log_fn(f"[OAuth] ⚠️ 令牌获取异常（非致命）: {exc}")
+        return False
 
 
 # ── State machine ──────────────────────────────────────────────────────────
