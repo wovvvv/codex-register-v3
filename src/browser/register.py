@@ -36,6 +36,7 @@ from playwright.async_api import Page
 from src.browser.engine import create_page
 from src.browser.helpers import (
     click_submit_or_text,
+    dismiss_google_one_tap,
     find_signup_button,
     human_move_and_click,
     is_error_page,
@@ -207,6 +208,40 @@ async def _safe_goto(
         raise
 
 
+async def _click_signup_entrypoint(task_id: str, page: Page, signup_btn) -> None:
+    """
+    点击注册入口，并在营销落地页按钮点击无效时回退到 DOM click。
+
+    现网 `chatgpt.com/auth/login` 的 `signup-button`/`login-button`
+    在 Camoufox 中可能表现为“按钮可见且可点击，但页面不会推进到邮箱输入态”。
+    此处先尝试真实鼠标点击；若短时间内既没有跳转、也没有出现邮箱框，
+    再回退到 `el.click()` 触发前端路由。
+    """
+    before_url = page.url
+    await dismiss_google_one_tap(page)
+
+    await human_move_and_click(page, signup_btn)
+    await jitter_sleep(3.0, 0.8)
+    await _assert_not_error(task_id, page)
+    logger.debug(f"[{task_id}] After signup click: {page.url}")
+
+    # 中文说明：营销页按钮在 Camoufox 下可能看似点击成功、但不会进入邮箱输入页。
+    # 这里用一个很短的探测等待，若页面已推进则不做任何回退，避免重复触发。
+    email_result = await wait_any_element(page, _EMAIL_SELECTORS, timeout_ms=1_500)
+    if email_result or page.url != before_url:
+        return
+
+    logger.warning(
+        f"[{task_id}] Signup click did not progress — falling back to DOM click. "
+        f"URL={page.url}"
+    )
+    await dismiss_google_one_tap(page)
+    await signup_btn.evaluate("el => el.click()")
+    await jitter_sleep(2.0, 0.5)
+    await _assert_not_error(task_id, page)
+    logger.debug(f"[{task_id}] After signup DOM click fallback: {page.url}")
+
+
 # ── Public entry-point ─────────────────────────────────────────────────────
 
 async def register_one(
@@ -275,6 +310,7 @@ async def register_one(
         "proxy":     proxy or "",
         "createdAt": datetime.now(timezone.utc).isoformat(),
     }
+    seen_otp_codes: set[str] = set()
 
     async with create_page(engine=engine, proxy=proxy, headless=headless, slow_mo=slow_mo, mobile=mobile) as page:
         for attempt in range(1, MAX_RETRIES + 1):
@@ -282,7 +318,7 @@ async def register_one(
                 logger.info(f"[{task_id}] Attempt {attempt}/{MAX_RETRIES} — {email}")
                 if log_fn:
                     log_fn(f"步骤 2/7: 尝试注册 {attempt}/{MAX_RETRIES}，邮箱: {email}")
-                await _state_machine(task_id, page, account, mail_client, timeouts, log_fn=log_fn)
+                await _state_machine(task_id, page, account, mail_client, timeouts, seen_otp_codes=seen_otp_codes, log_fn=log_fn)
                 account["status"] = "注册完成"
                 logger.success(f"[{task_id}] ✅ Done: {email}")
 
@@ -353,6 +389,8 @@ async def register_one(
 
             except RegistrationError as exc:
                 logger.warning(f"[{task_id}] Retry {attempt}/{MAX_RETRIES}: {exc}")
+                if log_fn:
+                    log_fn(f"⚠️ 重试原因：{exc}")
                 if attempt < MAX_RETRIES:
                     # Exponential back-off: 10 s, 20 s, 30 s, 40 s … capped at 60 s
                     backoff = min(10 * attempt, 60)
@@ -393,6 +431,7 @@ async def _state_machine(
     account: dict,
     mail_client: MailClient,
     timeouts: dict,
+    seen_otp_codes: Optional[set[str]] = None,
     log_fn=None,
 ) -> None:
     """
@@ -445,13 +484,7 @@ async def _state_machine(
 
         if signup_btn:
             logger.info(f"[{task_id}] Clicking Sign Up button (human simulation)")
-            # Use human-like mouse movement before click — Auth0 detects direct clicks
-            await human_move_and_click(page, signup_btn)
-
-            # tool.js: await _0x1ae(0xbb8) — 3 s after clicking signup
-            await jitter_sleep(3.0, 0.8)
-            await _assert_not_error(task_id, page)
-            logger.debug(f"[{task_id}] After signup click: {page.url}")
+            await _click_signup_entrypoint(task_id, page, signup_btn)
         else:
             raise RegistrationError(
                 f"Sign Up button not found after retrying. URL={page.url}"
@@ -604,14 +637,21 @@ async def _state_machine(
     # If no code arrives within timeout, click the "Resend" button and retry
     # (up to _RESEND_MAX extra attempts).
     _RESEND_MAX = 2
+    if seen_otp_codes is None:
+        seen_otp_codes = set()
     code = None
     for _resend_attempt in range(_RESEND_MAX + 1):
         await jitter_sleep(2.0, 0.5)  # _0x1ae(0x7d0)
-        code = await mail_client.poll_code(
+        code = await _poll_fresh_code(
+            task_id,
+            mail_client,
             account["email"],
+            previous_code=None,
+            seen_codes=seen_otp_codes,
             timeout=int(timeouts.get("otp_code", CODE_TIMEOUT)),
         )
         if code:
+            seen_otp_codes.add(code)
             break
 
         if _resend_attempt < _RESEND_MAX:
@@ -662,6 +702,7 @@ async def _state_machine(
                 mail_client,
                 account["email"],
                 previous_code=code,
+                seen_codes=seen_otp_codes,
                 timeout=int(timeouts.get("otp_code", CODE_TIMEOUT)),
             )
             if not new_code:
@@ -670,6 +711,7 @@ async def _state_machine(
                 break
 
             code = new_code
+            seen_otp_codes.add(code)
             logger.info(f"[{task_id}] 新验证码 → {code}")
             _step(6, f"重新填写验证码 {code}")
 
@@ -800,6 +842,8 @@ async def _wait_for_password_or_otp(page: Page, timeout_ms: int = 60_000) -> str
                 "input[type='text'][maxlength='1'], input[maxlength='1']"
             ).count()
             if count >= 4:
+                if _otp_url_looks_like_existing_account(url):
+                    return "already_registered"
                 return "otp"
         except Exception:
             pass
@@ -808,17 +852,40 @@ async def _wait_for_password_or_otp(page: Page, timeout_ms: int = 60_000) -> str
         for sel in _otp_check_selectors:
             try:
                 if await is_visible(page, sel):
+                    if _otp_url_looks_like_existing_account(url):
+                        return "already_registered"
                     return "otp"
             except Exception:
                 pass
 
         # Check URL pattern for magic link / email verification login
         if any(kw in url for kw in ("magic", "email-link", "email-verify", "check-email")):
+            if _otp_url_looks_like_existing_account(url):
+                return "already_registered"
             return "otp"
 
         await asyncio.sleep(0.5)
 
     return "none"
+
+
+def _otp_url_looks_like_existing_account(url: str) -> bool:
+    normalized = (url or "").lower()
+    if not normalized:
+        return False
+    if "/u/signup/" in normalized or "log-in-or-create-account" in normalized:
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "/u/login",
+            "/log-in",
+            "email-verification",
+            "magic",
+            "email-link",
+            "check-email",
+        )
+    )
 
 
 async def _assert_not_error(task_id: str, page: Page) -> None:
@@ -1038,6 +1105,7 @@ async def _poll_fresh_code(
     email: str,
     *,
     previous_code: Optional[str],
+    seen_codes: Optional[set[str]] = None,
     timeout: int,
 ) -> Optional[str]:
     """
@@ -1047,14 +1115,28 @@ async def _poll_fresh_code(
     Outlook's seen-ID tracking already helps, but this keeps the logic safe for
     other MailClient implementations too.
     """
+    seen = set(seen_codes or set())
+    if previous_code:
+        seen.add(previous_code)
+    supports_fresh_tracking = False
+    try:
+        supports_fresh_tracking = bool(mail_client.supports_fresh_message_tracking())
+    except Exception:
+        supports_fresh_tracking = False
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         remaining = max(1, int(deadline - asyncio.get_event_loop().time()))
         chunk = min(15, remaining)
         fresh_code = await mail_client.poll_code(email, timeout=chunk)
-        if fresh_code and fresh_code != previous_code:
-            return fresh_code
-        if fresh_code == previous_code:
+        if fresh_code:
+            if fresh_code not in seen:
+                return fresh_code
+            if supports_fresh_tracking:
+                logger.debug(
+                    f"[{task_id}] 收到同码新邮件 {fresh_code}，提供方已按消息粒度去重，接受该验证码"
+                )
+                return fresh_code
+        if fresh_code in seen:
             logger.debug(f"[{task_id}] 收到旧验证码 {fresh_code}，继续等待新验证码")
         await asyncio.sleep(1.0)
     return None

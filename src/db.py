@@ -43,6 +43,18 @@ _DDL = [
         is_active  INTEGER NOT NULL DEFAULT 1
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cli_proxy_monitor_history (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        deleted_at     TEXT NOT NULL DEFAULT '',
+        file_name      TEXT NOT NULL DEFAULT '',
+        email          TEXT NOT NULL DEFAULT '',
+        provider       TEXT NOT NULL DEFAULT '',
+        reason         TEXT NOT NULL DEFAULT '',
+        source         TEXT NOT NULL DEFAULT '',
+        status_message TEXT NOT NULL DEFAULT ''
+    )
+    """,
 ]
 
 # Idempotent migrations for pre-existing DBs that lack the token columns.
@@ -72,4 +84,3 @@ async def init() -> None:
 if __name__ == "__main__":
     asyncio.run(init())
     print(f"DB initialized at {DB_PATH}")
-

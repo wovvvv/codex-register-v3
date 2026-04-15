@@ -5,7 +5,9 @@ Import format is compatible with the original JS tool's JSON export.
 from __future__ import annotations
 
 import csv
+import io
 import json
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -14,6 +16,7 @@ import aiosqlite
 from loguru import logger
 
 from src.db import DB_PATH
+from src.integrations.cli_proxy import build_cli_proxy_token_json
 
 
 # ──────────────────────────────────────────────
@@ -113,6 +116,19 @@ async def list_all(status_filter: Optional[str] = None) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+async def get_by_email(email: str) -> Optional[dict]:
+    """按邮箱读取单个账号；不存在时返回 None。"""
+    normalized = (email or "").strip()
+    if not normalized:
+        return None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM accounts WHERE email = ?", (normalized,))
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row else None
+
+
 async def get_emails() -> set[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT email FROM accounts")
@@ -120,27 +136,67 @@ async def get_emails() -> set[str]:
     return {r[0] for r in rows}
 
 
+async def get_emails_with_access_token() -> set[str]:
+    """Return normalized emails whose ChatGPT/Codex access_token is non-empty."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT email
+            FROM accounts
+            WHERE TRIM(COALESCE(access_token, '')) != ''
+            """
+        )
+        rows = await cur.fetchall()
+    return {
+        str(row[0]).strip().lower()
+        for row in rows
+        if str(row[0]).strip()
+    }
+
+
 # ──────────────────────────────────────────────
 # Import / Export
 # ──────────────────────────────────────────────
 
+def _token_export_rows(rows: list[dict]) -> list[dict]:
+    return [
+        row for row in rows
+        if str(row.get("email", "") or "").strip()
+        and str(row.get("access_token", "") or "").strip()
+    ]
+
+
+def _zip_safe_account_name(email: str) -> str:
+    return str(email or "").strip().replace("/", "_").replace("\\", "_")
+
+
+def build_cpa_export_zip_bytes(rows: list[dict]) -> tuple[bytes, int]:
+    exportable = _token_export_rows(rows)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        password_lines: list[str] = []
+        for row in exportable:
+            email = str(row.get("email", "") or "").strip()
+            filename = _zip_safe_account_name(email)
+            payload = build_cli_proxy_token_json(row)
+            zf.writestr(
+                f"accounts/{filename}.json",
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            password_lines.append(f"{email}----{str(row.get('password', '') or '')}")
+
+        password_text = "\n".join(password_lines)
+        if password_text:
+            password_text += "\n"
+        zf.writestr("passwords.txt", password_text)
+
+    return buf.getvalue(), len(exportable)
+
 async def export_json(path: Path) -> int:
     rows = await list_all()
-    js_list = []
-    for r in rows:
-        raw = r.get("_raw") or {}
-        if not raw:
-            raw = {
-                "email":     r["email"],
-                "password":  r["password"],
-                "status":    r["status"],
-                "firstName": r["first_name"],
-                "lastName":  r["last_name"],
-                "createdAt": r["created_at"],
-            }
-        js_list.append(raw)
-    path.write_text(json.dumps(js_list, indent=2, ensure_ascii=False), encoding="utf-8")
-    return len(js_list)
+    content, count = build_cpa_export_zip_bytes(rows)
+    path.write_bytes(content)
+    return count
 
 
 async def export_csv(path: Path) -> int:
@@ -200,4 +256,3 @@ async def import_text(path: Path) -> tuple[int, int]:
         await upsert({"email": email, "password": password, "status": "imported"})
         added += 1
     return added, skipped
-

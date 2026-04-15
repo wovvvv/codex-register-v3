@@ -18,12 +18,15 @@ _SECTIONS = [
     "mail.gptmail",
     "mail.npcmail",
     "mail.yydsmail",
+    "mail.cfworker",
     "mail.imap",
     "mail.outlook",
     "registration",
     "team",
     "sync",
     "oauth",
+    "cli_proxy",
+    "sub2api_upload",
     "mouse",
     "timeouts",
     "timing",
@@ -31,7 +34,8 @@ _SECTIONS = [
 
 _DEFAULTS: dict[str, Any] = {
     "general": {
-        "engine":         "playwright",
+        # 默认浏览器引擎切到 Camoufox，避免新环境首次启动仍回落到 Playwright。
+        "engine":         "camoufox",
         "headless":       True,
         "slow_mo":        0,
         "mobile":         False,
@@ -39,16 +43,49 @@ _DEFAULTS: dict[str, Any] = {
         "mail_provider":  "gptmail",
         "proxy_strategy": "none",
         "proxy_static":   "",
+        "upload_provider": "none",
     },
     "mail.gptmail":  {"api_key": "", "base_url": "https://mail.chatgpt.org.uk"},
     "mail.npcmail":  {"api_key": "", "base_url": "https://dash.xphdfs.me"},
     "mail.yydsmail": {"api_key": "", "base_url": "https://maliapi.215.im/v1"},
+    "mail.cfworker": {
+        "api_url": "",
+        "admin_token": "",
+        "custom_auth": "",
+        "domain": "",
+        "domains": [],
+        "enabled_domains": [],
+        "subdomain": "",
+        "random_subdomain": False,
+        "fingerprint": "",
+    },
     "mail.imap":     [],
     "mail.outlook":  [],
     "registration": {"prefix": "", "domain": ""},
     "team": {"url": "", "key": ""},
     "sync": {"url": "", "key": ""},
-    "oauth": {"enabled": True, "timeout": 45},
+    "oauth": {"enabled": True, "timeout": 90},
+    "cli_proxy": {
+        "enabled": False,
+        "cpa_url": "",
+        "api_key": "",
+        "monitor_interval_minutes": 180,
+        "monitor_active_probe": False,
+        "monitor_probe_timeout": 8,
+    },
+    "sub2api_upload": {
+        "base_url": "",
+        "api_key": "",
+        "group_ids": [],
+        "proxy_id": 0,
+        "notes": "",
+        "concurrency": 1,
+        "load_factor": 1,
+        "priority": 2,
+        "rate_multiplier": 1,
+        "import_models": False,
+        "model_whitelist": [],
+    },
     "mouse": {
         "human_simulation": True,
         "steps_min":        4,
@@ -73,7 +110,7 @@ _DEFAULTS: dict[str, Any] = {
         "oauth_login_email":    8,
         "oauth_login_password": 10,
         "oauth_token_exchange": 30,
-        "oauth_total":          45,
+        "oauth_total":          90,
     },
     "timing": {
         "post_nav":      1.0,
@@ -159,12 +196,15 @@ async def build_config() -> dict[str, Any]:
         "gptmail":  copy.deepcopy(db.get("mail.gptmail",  _DEFAULTS["mail.gptmail"])),
         "npcmail":  copy.deepcopy(db.get("mail.npcmail",  _DEFAULTS["mail.npcmail"])),
         "yydsmail": copy.deepcopy(db.get("mail.yydsmail", _DEFAULTS["mail.yydsmail"])),
+        "cfworker": copy.deepcopy(db.get("mail.cfworker", _DEFAULTS["mail.cfworker"])),
         "imap":     copy.deepcopy(db.get("mail.imap",     _DEFAULTS["mail.imap"])),
         "outlook":  copy.deepcopy(db.get("mail.outlook",  _DEFAULTS["mail.outlook"])),
     }
     cfg["registration"] = copy.deepcopy(db.get("registration", _DEFAULTS["registration"]))
     cfg["team"]         = copy.deepcopy(db.get("team",         _DEFAULTS["team"]))
     cfg["sync"]         = copy.deepcopy(db.get("sync",         _DEFAULTS["sync"]))
+    cfg["cli_proxy"]    = copy.deepcopy(db.get("cli_proxy",    _DEFAULTS["cli_proxy"]))
+    cfg["sub2api_upload"] = copy.deepcopy(db.get("sub2api_upload", _DEFAULTS["sub2api_upload"]))
     cfg["mouse"]        = copy.deepcopy(db.get("mouse",        _DEFAULTS["mouse"]))
     cfg["timeouts"]     = copy.deepcopy(db.get("timeouts",     _DEFAULTS["timeouts"]))
     cfg["timing"]       = copy.deepcopy(db.get("timing",       _DEFAULTS["timing"]))
@@ -172,7 +212,7 @@ async def build_config() -> dict[str, Any]:
     oauth_db = copy.deepcopy(db.get("oauth", _DEFAULTS["oauth"]))
     cfg["oauth"] = oauth_db
     cfg["enable_oauth"] = oauth_db.get("enabled", True)
-    cfg["timeouts"]["oauth_total"] = oauth_db.get("timeout", cfg["timeouts"].get("oauth_total", 45))
+    cfg["timeouts"]["oauth_total"] = oauth_db.get("timeout", cfg["timeouts"].get("oauth_total", 90))
+    cfg["upload_provider"] = str(cfg.get("upload_provider", "none") or "none").strip().lower() or "none"
 
     return cfg
-

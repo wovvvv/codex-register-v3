@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+accounts.db
+register.log
+data
+test
+src/webui/static
+webui_frontend/node_modules

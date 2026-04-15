@@ -57,6 +57,11 @@ export function Accounts() {
   const [sel, setSel]           = useState(new Set())
   const [selAllDB, setSelAllDB] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [uploading, setUploading] = useState({})
+  const [sub2apiUploading, setSub2apiUploading] = useState({})
+  const [batchUploading, setBatchUploading] = useState(false)
+  const [batchSub2APIUploading, setBatchSub2APIUploading] = useState(false)
+  const [exportingTokenZip, setExportingTokenZip] = useState(false)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -77,6 +82,11 @@ export function Accounts() {
   const toggleRow  = (email) => { setSelAllDB(false); setSel(s => { const n = new Set(s); n.has(email) ? n.delete(email) : n.add(email); return n }) }
   const togglePage = () => { setSelAllDB(false); setSel(s => { const n = new Set(s); if (allPageSel) pageEmails.forEach(e => n.delete(e)); else pageEmails.forEach(e => n.add(e)); return n }) }
   const clearSel   = () => { setSel(new Set()); setSelAllDB(false) }
+  const tokenEmailSet = new Set(rows.filter(r => !!r.access_token).map(r => r.email))
+  const refreshTokenEmailSet = new Set(rows.filter(r => !!r.refresh_token).map(r => r.email))
+  const selectedExplicitEmails = [...sel]
+  const selectedUploadableEmails = selectedExplicitEmails.filter(email => tokenEmailSet.has(email))
+  const selectedSub2APIUploadableEmails = selectedExplicitEmails.filter(email => refreshTokenEmailSet.has(email))
 
   const handleDelete = async () => {
     const n = selAllDB ? total : sel.size
@@ -87,6 +97,109 @@ export function Accounts() {
       clearSel(); load()
     } catch (e) { alert('删除失败：' + e.message) }
     finally { setDeleting(false) }
+  }
+
+  const handleUploadOne = async (email) => {
+    setUploading((prev) => ({ ...prev, [email]: true }))
+    try {
+      const resp = await api.uploadCliProxy({ email })
+      if (resp.ok) alert(`上传成功：${email}`)
+      else alert(`上传失败：${resp.message || '未知错误'}`)
+    } catch (e) {
+      alert('上传失败：' + e.message)
+    } finally {
+      setUploading((prev) => ({ ...prev, [email]: false }))
+    }
+  }
+
+  const handleBatchUpload = async () => {
+    if (selAllDB) {
+      alert('批量上传仅支持当前显式选中的邮箱集合，不支持“全库选择”。')
+      return
+    }
+    if (selectedExplicitEmails.length === 0) {
+      alert('请先勾选要上传的账号。')
+      return
+    }
+    if (selectedUploadableEmails.length === 0) {
+      alert('所选账号均无 access_token，无法上传 CPA。')
+      return
+    }
+
+    setBatchUploading(true)
+    try {
+      const resp = await api.uploadCliProxyBatch({ emails: selectedUploadableEmails })
+      const skipped = selectedExplicitEmails.length - selectedUploadableEmails.length
+      const skippedHint = skipped > 0 ? `，跳过无 access_token ${skipped} 条` : ''
+      alert(`批量上传完成：成功 ${resp.success}/${resp.total}${skippedHint}`)
+    } catch (e) {
+      alert('批量上传失败：' + e.message)
+    } finally {
+      setBatchUploading(false)
+    }
+  }
+
+  const handleUploadOneSub2API = async (email) => {
+    setSub2apiUploading((prev) => ({ ...prev, [email]: true }))
+    try {
+      const resp = await api.uploadSub2API({ email })
+      if (resp.ok) alert(`上传成功：${email}`)
+      else alert(`上传失败：${resp.message || '未知错误'}`)
+    } catch (e) {
+      alert('上传失败：' + e.message)
+    } finally {
+      setSub2apiUploading((prev) => ({ ...prev, [email]: false }))
+    }
+  }
+
+  const handleBatchUploadSub2API = async () => {
+    if (selAllDB) {
+      alert('批量上传仅支持当前显式选中的邮箱集合，不支持“全库选择”。')
+      return
+    }
+    if (selectedExplicitEmails.length === 0) {
+      alert('请先勾选要上传的账号。')
+      return
+    }
+    if (selectedSub2APIUploadableEmails.length === 0) {
+      alert('所选账号均无 refresh_token，无法上传 Sub2API。')
+      return
+    }
+
+    setBatchSub2APIUploading(true)
+    try {
+      const resp = await api.uploadSub2APIBatch({ emails: selectedSub2APIUploadableEmails })
+      const skipped = selectedExplicitEmails.length - selectedSub2APIUploadableEmails.length
+      const skippedHint = skipped > 0 ? `，跳过无 refresh_token ${skipped} 条` : ''
+      alert(`批量上传完成：成功 ${resp.success}/${resp.total}${skippedHint}`)
+    } catch (e) {
+      alert('批量上传失败：' + e.message)
+    } finally {
+      setBatchSub2APIUploading(false)
+    }
+  }
+
+  const handleExportTokenZip = async () => {
+    setExportingTokenZip(true)
+    try {
+      const body = selAllDB || sel.size === 0
+        ? { select_all: true, status }
+        : { emails: [...sel] }
+
+      const { blob, filename } = await api.exportTokenZip(body)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      alert('导出失败：' + e.message)
+    } finally {
+      setExportingTokenZip(false)
+    }
   }
 
   return (
@@ -102,7 +215,13 @@ export function Accounts() {
             {STATUSES.map(s => <option key={s} value={s}>{s || '全部状态'}</option>)}
           </select>
           <a href={api.exportUrl('csv')} className="bg-white border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 transition-colors">导出 CSV</a>
-          <a href={api.exportUrl('json')} className="bg-white border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 transition-colors">导出 JSON</a>
+          <button
+            onClick={handleExportTokenZip}
+            disabled={exportingTokenZip}
+            className="bg-white border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-60 transition-colors"
+          >
+            {exportingTokenZip ? '导出中…' : '导出 Token ZIP'}
+          </button>
           <button onClick={load} className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-2 text-sm font-medium transition-colors">刷新</button>
         </div>
       </div>
@@ -134,16 +253,20 @@ export function Accounts() {
                   onChange={togglePage}
                 />
               </th>
-              {['邮箱', '密码', '状态', '服务商', 'Access Token', '注册时间'].map(h => (
+              {['邮箱', '密码', '状态', '服务商', 'Access Token', '注册时间', '操作'].map(h => (
                 <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">{h}</th>
               ))}
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-50">
-            {loading && rows.length === 0 && <tr><td colSpan={7} className="text-center py-12 text-gray-400">加载中…</td></tr>}
-            {!loading && rows.length === 0 && <tr><td colSpan={7} className="text-center py-12 text-gray-400">暂无数据</td></tr>}
+            {loading && rows.length === 0 && <tr><td colSpan={8} className="text-center py-12 text-gray-400">加载中…</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={8} className="text-center py-12 text-gray-400">暂无数据</td></tr>}
             {rows.map(r => {
               const checked = selAllDB || sel.has(r.email)
+              const canUpload = !!r.access_token
+              const canUploadSub2API = !!r.refresh_token
+              const rowUploading = !!uploading[r.email]
+              const rowSub2APIUploading = !!sub2apiUploading[r.email]
               return (
                 <tr key={r.email} className={`transition-colors ${checked ? 'bg-blue-50' : 'hover:bg-gray-50'}`}>
                   <td className="px-4 py-3 w-10">
@@ -159,6 +282,26 @@ export function Accounts() {
                       : <span className="text-gray-300 text-xs">—</span>}
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-400 whitespace-nowrap">{r.created_at?.slice(0, 19) || '—'}</td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleUploadOne(r.email)}
+                        disabled={!canUpload || rowUploading}
+                        title={canUpload ? '' : '该账号暂无可上传认证信息'}
+                        className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-2.5 py-1.5 rounded-lg transition-colors"
+                      >
+                        {rowUploading ? '上传中…' : '上传 CPA'}
+                      </button>
+                      <button
+                        onClick={() => handleUploadOneSub2API(r.email)}
+                        disabled={!canUploadSub2API || rowSub2APIUploading}
+                        title={canUploadSub2API ? '' : '该账号暂无 refresh_token，无法上传 Sub2API'}
+                        className="bg-teal-600 hover:bg-teal-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-2.5 py-1.5 rounded-lg transition-colors"
+                      >
+                        {rowSub2APIUploading ? '上传中…' : '上传 Sub2API'}
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               )
             })}
@@ -177,6 +320,22 @@ export function Accounts() {
       )}
 
       <BulkBar selCount={sel.size} total={total} selAllDB={selAllDB} onSelectAllDB={() => setSelAllDB(true)} onClearSel={clearSel}>
+        <button
+          onClick={handleBatchUpload}
+          disabled={batchUploading || selAllDB || selectedUploadableEmails.length === 0}
+          title={selAllDB ? '批量上传仅支持显式选中的邮箱集合' : (selectedUploadableEmails.length === 0 ? '所选账号暂无可上传认证信息' : '')}
+          className="flex items-center gap-1.5 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-60 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+        >
+          {batchUploading ? '上传中…' : '⬆️ 上传所选'}
+        </button>
+        <button
+          onClick={handleBatchUploadSub2API}
+          disabled={batchSub2APIUploading || selAllDB || selectedSub2APIUploadableEmails.length === 0}
+          title={selAllDB ? '批量上传仅支持显式选中的邮箱集合' : (selectedSub2APIUploadableEmails.length === 0 ? '所选账号暂无 refresh_token' : '')}
+          className="flex items-center gap-1.5 bg-teal-500 hover:bg-teal-600 disabled:opacity-60 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors"
+        >
+          {batchSub2APIUploading ? '上传中…' : '⬆️ 上传 Sub2API'}
+        </button>
         <button onClick={handleDelete} disabled={deleting}
           className="flex items-center gap-1.5 bg-red-500 hover:bg-red-600 disabled:opacity-60 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">
           {deleting ? '删除中…' : '🗑️ 删除所选'}

@@ -2,6 +2,31 @@
 import { useState, useEffect, useCallback, useRef, createContext, useContext, useMemo } from 'react'
 import api from '../lib/api.js'
 import { Spinner } from '../components/Badge.jsx'
+import {
+  EMPTY_IMAP_ACCOUNT,
+  EMPTY_IMAP_PROVIDER,
+  normalizeImapProviders,
+  serializeImapProviders,
+  validateRegistrationDomain,
+} from '../lib/imapProviders.js'
+import {
+  buildSettingsProviderOptions,
+  DEFAULT_SETTINGS_PROVIDER_OPTIONS,
+  EMPTY_CFWORKER_CONFIG,
+  normalizeCfworkerConfig,
+  normalizeDomainList,
+  serializeCfworkerConfig,
+} from '../lib/cfworkerConfig.js'
+import {
+  EMPTY_CLI_PROXY_CONFIG,
+  normalizeCliProxyConfig,
+  serializeCliProxyConfig,
+} from '../lib/cliProxyConfig.js'
+import {
+  EMPTY_SUB2API_UPLOAD_CONFIG,
+  normalizeSub2APIUploadConfig,
+  serializeSub2APIUploadConfig,
+} from '../lib/sub2apiUploadConfig.js'
 
 // ── Sticky save context ───────────────────────────────────────────────────
 // Tabs register their save function here so the sticky header can call it.
@@ -227,39 +252,10 @@ function ImportModal({ title, placeholder, hint, onParse, onImport, onClose }) {
 }
 
 function useProviderOptions() {
-  const [opts, setOpts] = useState([
-    ['imap:0', 'IMAP 服务商 1'], ['gptmail', 'GptMail'],
-  ])
+  const [opts, setOpts] = useState(DEFAULT_SETTINGS_PROVIDER_OPTIONS)
   useEffect(() => {
     api.getSettings().then(s => {
-      const items = []
-      const imapProviders = Array.isArray(s['mail.imap']) ? s['mail.imap'] : []
-      const isNewFormat = imapProviders.length > 0 && 'accounts' in imapProviders[0]
-      if (isNewFormat) {
-        imapProviders.forEach((prov, i) => {
-          const name = prov.name || `IMAP 服务商 ${i + 1}`
-          const accs = Array.isArray(prov.accounts) ? prov.accounts : []
-          items.push([`imap:${i}`, `${name}（全部 ${accs.length} 账户轮换）`])
-          accs.forEach((acc, j) => {
-            items.push([`imap:${i}:${j}`, `└ ${acc.email || `账户 ${j + 1}`}`])
-          })
-        })
-      } else {
-        imapProviders.forEach((acc, i) =>
-          items.push([`imap:${i}`, acc.email ? `IMAP: ${acc.email}` : `IMAP 账户 ${i + 1}`])
-        )
-      }
-      if (items.filter(([v]) => v.startsWith('imap')).length === 0)
-        items.push(['imap:0', 'IMAP 服务商 1'])
-      const outlookAccounts = Array.isArray(s['mail.outlook']) ? s['mail.outlook'] : []
-      if (outlookAccounts.length > 0) {
-        items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
-        outlookAccounts.forEach((acc, i) => {
-          items.push([`outlook:${i}`, `└ ${acc.email || `Outlook 账户 ${i + 1}`}`])
-        })
-      }
-      items.push(['gptmail', 'GptMail'], ['npcmail', 'NpcMail'], ['yydsmail', 'YYDSMail'])
-      setOpts(items)
+      setOpts(buildSettingsProviderOptions(s))
     }).catch(() => {})
   }, [])
   return opts
@@ -355,20 +351,453 @@ function TabMail() {
   )
 }
 
-// ── Tab: IMAP accounts (provider+accounts structure) ──────────────────────
+function TabCfworker() {
+  const [data, setData] = useState({ ...EMPTY_CFWORKER_CONFIG })
+  const [domainsRaw, setDomainsRaw] = useState('')
+  const [enabledDomainsRaw, setEnabledDomainsRaw] = useState('')
+  const { run, registerSave } = useSave()
 
-const EMPTY_IMAP_PROVIDER = {
-  name: '新 IMAP 服务商',
-  host: '',
-  port: 993,
-  ssl: true,
-  folder: 'INBOX',
-  auth_type: 'password',
-  use_alias: null,
-  accounts: [],
+  useEffect(() => {
+    api.getSection('mail.cfworker')
+      .then((raw) => {
+        const normalized = normalizeCfworkerConfig(raw)
+        setData(normalized)
+        setDomainsRaw(normalized.domains.join('\n'))
+        setEnabledDomainsRaw(normalized.enabled_domains.join('\n'))
+      })
+      .catch(() => {
+        setData({ ...EMPTY_CFWORKER_CONFIG })
+        setDomainsRaw('')
+        setEnabledDomainsRaw('')
+      })
+  }, [])
+
+  const setField = (key, value) => {
+    setData((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const syncDomainDrafts = useCallback(() => {
+    const domains = normalizeDomainList(domainsRaw)
+    const enabledDomains = normalizeDomainList(enabledDomainsRaw).filter((domain) => domains.includes(domain))
+    const next = normalizeCfworkerConfig({ ...data, domains, enabled_domains: enabledDomains })
+    setData(next)
+    setDomainsRaw(next.domains.join('\n'))
+    setEnabledDomainsRaw(next.enabled_domains.join('\n'))
+    return next
+  }, [data, domainsRaw, enabledDomainsRaw])
+
+  const handleDomainsBlur = () => { syncDomainDrafts() }
+  const handleEnabledDomainsBlur = () => { syncDomainDrafts() }
+
+  const save = useCallback(() => run(async () => {
+    const next = syncDomainDrafts()
+    const payload = serializeCfworkerConfig(next)
+    await api.saveSection('mail.cfworker', payload)
+    const normalizedSaved = normalizeCfworkerConfig(payload)
+    setData(normalizedSaved)
+    setDomainsRaw(normalizedSaved.domains.join('\n'))
+    setEnabledDomainsRaw(normalizedSaved.enabled_domains.join('\n'))
+  }), [run, syncDomainDrafts])
+
+  useEffect(() => { registerSave(save) }, [save, registerSave])
+
+  return (
+    <div className="space-y-4">
+      <Section
+        title="CF Worker"
+        desc="保存此配置不会自动切换默认邮件服务商；仅当“通用配置”中的 mail_provider=cfworker 时生效。"
+      >
+        <Field label="API URL">
+          <Input
+            value={data.api_url}
+            onChange={(e) => setField('api_url', e.target.value)}
+            placeholder="https://worker.example.workers.dev"
+          />
+        </Field>
+        <Field label="Admin Token">
+          <Input
+            type="password"
+            value={data.admin_token}
+            onChange={(e) => setField('admin_token', e.target.value)}
+            placeholder="管理令牌"
+          />
+        </Field>
+        <Field label="Custom Auth">
+          <Input
+            value={data.custom_auth}
+            onChange={(e) => setField('custom_auth', e.target.value)}
+            placeholder="自定义认证头/值"
+          />
+        </Field>
+        <Field label="Fingerprint">
+          <Input
+            value={data.fingerprint}
+            onChange={(e) => setField('fingerprint', e.target.value)}
+            placeholder="指纹标识（可选）"
+          />
+        </Field>
+        <Field label="Domain" hint="仅在不使用 domains 池时生效">
+          <Input
+            value={data.domain}
+            onChange={(e) => setField('domain', e.target.value)}
+            placeholder="example.com"
+          />
+        </Field>
+        <Field label="Domains" hint="多域名池；支持逗号或换行分隔">
+          <textarea
+            rows={4}
+            value={domainsRaw}
+            onChange={(e) => setDomainsRaw(e.target.value)}
+            onBlur={handleDomainsBlur}
+            placeholder={'a.com\nb.com'}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </Field>
+        <Field label="Enabled Domains" hint="仅保留 domains 中存在的值">
+          <textarea
+            rows={3}
+            value={enabledDomainsRaw}
+            onChange={(e) => setEnabledDomainsRaw(e.target.value)}
+            onBlur={handleEnabledDomainsBlur}
+            placeholder={'a.com'}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </Field>
+        <Field label="Subdomain">
+          <Input
+            value={data.subdomain}
+            onChange={(e) => setField('subdomain', e.target.value)}
+            placeholder="mail"
+          />
+        </Field>
+        <Field label="Random Subdomain">
+          <Toggle checked={!!data.random_subdomain} onChange={(v) => setField('random_subdomain', v)} />
+        </Field>
+      </Section>
+    </div>
+  )
 }
 
-const EMPTY_IMAP_ACCOUNT = { email: '', credential: '' }
+function TabCliProxy() {
+  const [data, setData] = useState({ ...EMPTY_CLI_PROXY_CONFIG })
+  const [monitorStatus, setMonitorStatus] = useState(null)
+  const [monitorHistory, setMonitorHistory] = useState([])
+  const [monitorBusy, setMonitorBusy] = useState('')
+  const { run, registerSave } = useSave()
+
+  useEffect(() => {
+    api.getSection('cli_proxy')
+      .then((raw) => setData(normalizeCliProxyConfig(raw)))
+      .catch(() => setData({ ...EMPTY_CLI_PROXY_CONFIG }))
+  }, [])
+
+  const loadMonitor = useCallback(() => {
+    Promise.all([
+      api.getCliProxyMonitorStatus(),
+      api.getCliProxyMonitorHistory(50),
+    ]).then(([status, history]) => {
+      setMonitorStatus(status)
+      setMonitorHistory(Array.isArray(history?.items) ? history.items : [])
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    loadMonitor()
+    const id = setInterval(loadMonitor, 5000)
+    return () => clearInterval(id)
+  }, [loadMonitor])
+
+  const setField = (key, value) => {
+    setData((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const save = useCallback(() => run(async () => {
+    const payload = serializeCliProxyConfig(data)
+    await api.saveSection('cli_proxy', payload)
+    setData(normalizeCliProxyConfig(payload))
+  }), [run, data])
+
+  useEffect(() => { registerSave(save) }, [save, registerSave])
+
+  const handleMonitorAction = async (action) => {
+    setMonitorBusy(action)
+    try {
+      if (action === 'start') await api.startCliProxyMonitor()
+      else if (action === 'stop') await api.stopCliProxyMonitor()
+      else await api.runCliProxyMonitorOnce()
+      loadMonitor()
+    } catch (e) {
+      alert('监控操作失败：' + e.message)
+    } finally {
+      setMonitorBusy('')
+    }
+  }
+
+  const formatTs = (value) => {
+    if (!value) return '—'
+    return new Date(value * 1000).toLocaleString('zh-CN', { hour12: false })
+  }
+
+  return (
+    <div className="space-y-4">
+      <Section
+        title="CLI Proxy"
+        desc="用于 CPA 文件上传；同一个 CPA URL 可填写本地或远程地址。"
+      >
+        <Field label="启用自动上传" hint="注册成功并拿到 access_token 后，自动上传到 CLI Proxy">
+          <Toggle checked={!!data.enabled} onChange={(v) => setField('enabled', v)} />
+        </Field>
+        <Field label="CPA URL" hint="可填写本地或远程管理地址；支持直接填写 management.html#/ 页面地址">
+          <Input
+            value={data.cpa_url}
+            onChange={(e) => setField('cpa_url', e.target.value)}
+            placeholder="http://127.0.0.1:8317/management.html#/"
+          />
+        </Field>
+        <Field label="API Key" hint="上传接口鉴权：Authorization Bearer Token">
+          <Input
+            type="password"
+            value={data.api_key}
+            onChange={(e) => setField('api_key', e.target.value)}
+            placeholder="请输入 CLI Proxy API Key"
+          />
+        </Field>
+      </Section>
+
+      <Section
+        title="认证文件监控"
+        desc="手动启动定时检查 CPA 认证文件；命中 401 后自动删除，并写入日志与历史记录。"
+      >
+        <Field label="检查间隔（分钟）" hint="例如 10 表示每 10 分钟检查一次">
+          <Input
+            type="number"
+            min="1"
+            value={data.monitor_interval_minutes}
+            onChange={(e) => setField('monitor_interval_minutes', e.target.value)}
+          />
+        </Field>
+        <Field label="启用主动 Probe" hint="默认关闭；开启后会对 codex 文件额外发起主动探测">
+          <Toggle checked={!!data.monitor_active_probe} onChange={(v) => setField('monitor_active_probe', v)} />
+        </Field>
+        <Field label="Probe 超时（秒）">
+          <Input
+            type="number"
+            min="1"
+            value={data.monitor_probe_timeout}
+            onChange={(e) => setField('monitor_probe_timeout', e.target.value)}
+          />
+        </Field>
+        <div className="pt-4 flex items-center gap-3 flex-wrap">
+          <button
+            onClick={() => handleMonitorAction('start')}
+            disabled={monitorBusy !== ''}
+            className="bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {monitorBusy === 'start' ? '启动中…' : '启动监控'}
+          </button>
+          <button
+            onClick={() => handleMonitorAction('stop')}
+            disabled={monitorBusy !== ''}
+            className="bg-gray-700 hover:bg-gray-800 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {monitorBusy === 'stop' ? '停止中…' : '停止监控'}
+          </button>
+          <button
+            onClick={() => handleMonitorAction('run-once')}
+            disabled={monitorBusy !== ''}
+            className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {monitorBusy === 'run-once' ? '执行中…' : '立即检查一次'}
+          </button>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+          <div className="rounded-lg border border-gray-100 bg-gray-50 px-4 py-3">
+            <p className="text-gray-500">当前状态</p>
+            <p className="font-semibold text-gray-800 mt-1">
+              {monitorStatus?.running ? '运行中' : '未运行'}
+              {monitorStatus?.busy ? ' · 执行中' : ''}
+            </p>
+          </div>
+          <div className="rounded-lg border border-gray-100 bg-gray-50 px-4 py-3">
+            <p className="text-gray-500">最近结果</p>
+            <p className="font-semibold text-gray-800 mt-1">
+              {monitorStatus?.last_result
+                ? `检查 ${monitorStatus.last_result.checked ?? 0} / 删除 ${monitorStatus.last_result.deleted ?? 0}`
+                : '—'}
+            </p>
+          </div>
+          <div className="rounded-lg border border-gray-100 bg-gray-50 px-4 py-3">
+            <p className="text-gray-500">启动时间</p>
+            <p className="font-semibold text-gray-800 mt-1">{formatTs(monitorStatus?.started_at)}</p>
+          </div>
+          <div className="rounded-lg border border-gray-100 bg-gray-50 px-4 py-3">
+            <p className="text-gray-500">下次运行</p>
+            <p className="font-semibold text-gray-800 mt-1">{formatTs(monitorStatus?.next_run_at)}</p>
+          </div>
+        </div>
+
+        <div className="mt-5 border border-gray-100 rounded-lg overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
+            <h4 className="text-sm font-semibold text-gray-700">删除历史</h4>
+            <span className="text-xs text-gray-400">最近 {monitorHistory.length} 条</span>
+          </div>
+          {monitorHistory.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-8">暂无删除记录</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead className="bg-white border-b border-gray-100">
+                  <tr>
+                    {['时间', '文件名', '邮箱', '来源', '原因'].map((h) => (
+                      <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {monitorHistory.map((item) => (
+                    <tr key={`${item.id}-${item.file_name}`}>
+                      <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">{item.deleted_at || '—'}</td>
+                      <td className="px-4 py-3 text-xs font-mono text-gray-700">{item.file_name || '—'}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600">{item.email || '—'}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600">{item.source || '—'}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600">{item.reason || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+function TabSub2APIUpload() {
+  const [general, setGeneral] = useState({ upload_provider: 'none' })
+  const [data, setData] = useState({ ...EMPTY_SUB2API_UPLOAD_CONFIG })
+  const [groupIdsText, setGroupIdsText] = useState('')
+  const [modelWhitelistText, setModelWhitelistText] = useState('')
+  const { run, registerSave } = useSave()
+
+  useEffect(() => {
+    Promise.all([
+      api.getConfig().catch(() => ({})),
+      api.getSection('sub2api_upload').catch(() => ({})),
+    ]).then(([generalRaw, sectionRaw]) => {
+      setGeneral({ upload_provider: typeof generalRaw?.upload_provider === 'string' ? generalRaw.upload_provider : 'none' })
+      const normalized = normalizeSub2APIUploadConfig(sectionRaw)
+      setData(normalized)
+      setGroupIdsText(normalized.group_ids.join('\n'))
+      setModelWhitelistText(normalized.model_whitelist.join('\n'))
+    }).catch(() => {
+      setGeneral({ upload_provider: 'none' })
+      setData({ ...EMPTY_SUB2API_UPLOAD_CONFIG })
+      setGroupIdsText('')
+      setModelWhitelistText('')
+    })
+  }, [])
+
+  const setField = (key, value) => setData((prev) => ({ ...prev, [key]: value }))
+  const handleGroupIdsTextChange = (value) => {
+    setGroupIdsText(value)
+    setData((prev) => ({
+      ...prev,
+      group_ids: value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+    }))
+  }
+  const handleModelWhitelistTextChange = (value) => {
+    setModelWhitelistText(value)
+    setData((prev) => ({
+      ...prev,
+      model_whitelist: value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+    }))
+  }
+
+  const save = useCallback(() => run(async () => {
+    await api.saveConfig({ upload_provider: general.upload_provider })
+    const payload = serializeSub2APIUploadConfig(data)
+    await api.saveSection('sub2api_upload', payload)
+    setData(normalizeSub2APIUploadConfig(payload))
+  }), [run, data, general])
+
+  useEffect(() => { registerSave(save) }, [save, registerSave])
+
+  return (
+    <div className="space-y-4">
+      <Section
+        title="自动上传目标"
+        desc="保留 CPA 自动上传，同时支持自动上传到 Sub2API。"
+      >
+        <Field label="默认上传目标" hint="none=不自动上传，cpa=保持现有 CPA，sub2api=自动导入到 Sub2API">
+          <Select
+            value={general.upload_provider}
+            onChange={(e) => setGeneral({ upload_provider: e.target.value })}
+            options={[
+              ['none', '不自动上传'],
+              ['cpa', 'CLI Proxy / CPA'],
+              ['sub2api', 'Sub2API'],
+            ]}
+          />
+        </Field>
+      </Section>
+
+      <Section
+        title="Sub2API"
+        desc="当默认上传目标或任务覆盖选择为 Sub2API 时，这里的值会作为全局默认导入参数。"
+      >
+        <Field label="Base URL" hint="例如 http://sub2api:8080 或 https://your-domain">
+          <Input value={data.base_url} onChange={(e) => setField('base_url', e.target.value)} placeholder="http://sub2api:8080" />
+        </Field>
+        <Field label="API Key" hint="Sub2API worker ingest Bearer Token">
+          <Input type="password" value={data.api_key} onChange={(e) => setField('api_key', e.target.value)} placeholder="请输入 worker token" />
+        </Field>
+        <Field label="Group IDs" hint="支持多个分组 ID，按行或逗号分隔">
+          <textarea
+            rows={3}
+            value={groupIdsText}
+            onChange={(e) => handleGroupIdsTextChange(e.target.value)}
+            placeholder={"1\n2"}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </Field>
+        <Field label="Proxy ID">
+          <Input type="number" min="1" value={data.proxy_id} onChange={(e) => setField('proxy_id', e.target.value)} placeholder="可留空" />
+        </Field>
+        <Field label="备注">
+          <Input value={data.notes} onChange={(e) => setField('notes', e.target.value)} placeholder="register worker" />
+        </Field>
+        <Field label="并发数">
+          <Input type="number" min="1" value={data.concurrency} onChange={(e) => setField('concurrency', e.target.value)} />
+        </Field>
+        <Field label="负载因子" hint="提高负载因子可以提高对账号的调度频率">
+          <Input type="number" min="1" value={data.load_factor} onChange={(e) => setField('load_factor', e.target.value)} />
+        </Field>
+        <Field label="优先级" hint="优先级越小的账号优先使用">
+          <Input type="number" min="1" value={data.priority} onChange={(e) => setField('priority', e.target.value)} />
+        </Field>
+        <Field label="账号计费倍率" hint="0 表示不计费，仅影响账号计费">
+          <Input type="number" min="0" step="0.1" value={data.rate_multiplier} onChange={(e) => setField('rate_multiplier', e.target.value)} />
+        </Field>
+        <Field label="自动获取可用模型">
+          <Toggle checked={!!data.import_models} onChange={(value) => setField('import_models', value)} />
+        </Field>
+        <Field label="模型白名单" hint="按行或逗号分隔；导入时会转成 Sub2API 的 model_mapping">
+          <textarea
+            rows={4}
+            value={modelWhitelistText}
+            onChange={(e) => handleModelWhitelistTextChange(e.target.value)}
+            placeholder={"gpt-5.4\ngpt-5.1-codex"}
+            className="block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </Field>
+      </Section>
+    </div>
+  )
+}
+
+// ── Tab: IMAP accounts (provider+accounts structure) ──────────────────────
 
 const IMAP_ACCOUNT_IMPORT_HINT = `# 每行一个账户，格式: 邮箱<空格或TAB>密码/授权码
 # 也支持四短线分隔：
@@ -450,22 +879,25 @@ function TabImap() {
 
   const load = useCallback(() => {
     api.getSection('mail.imap').then(d => {
-      const raw = Array.isArray(d) ? d : []
-      if (raw.length > 0 && !('accounts' in raw[0])) {
-        setProviders([{
-          ...EMPTY_IMAP_PROVIDER,
-          name: '默认 IMAP 服务商',
-          accounts: raw.map(a => ({ email: a.email || '', credential: a.password || a.access_token || '' })),
-        }])
-      } else {
-        setProviders(raw)
-      }
+      setProviders(normalizeImapProviders(d))
       setImapSel({})
     }).catch(() => {})
   }, [])
   useEffect(() => { load() }, [load])
 
-  const save = useCallback(() => run(() => api.saveSection('mail.imap', providers)), [run, providers])
+  const save = useCallback(() => run(async () => {
+    const serialized = serializeImapProviders(providers)
+    serialized.forEach((prov, i) => {
+      const mode = prov.address_mode
+      const registrationDomain = validateRegistrationDomain(prov.registration_domain)
+      if (mode === 'random_local_part' && !registrationDomain) {
+        throw new Error(`第 ${i + 1} 个服务商的注册域名不合法`)
+      }
+      prov.registration_domain = registrationDomain
+    })
+    await api.saveSection('mail.imap', serialized)
+    setProviders(serialized)
+  }), [run, providers])
   useEffect(() => { registerSave(save) }, [save, registerSave])
 
   // Provider helpers
@@ -562,7 +994,11 @@ function TabImap() {
                     <Input value={prov.host || ''} onChange={e => updateProvider(pi, 'host', e.target.value)} placeholder="imap.qq.com（可留空）" />
                   </Field>
                   <Field label="端口">
-                    <Input type="number" value={prov.port || 993} onChange={e => updateProvider(pi, 'port', +e.target.value)} />
+                    <Input
+                      type="number"
+                      value={prov.port === '' || prov.port === null || prov.port === undefined ? '' : String(prov.port)}
+                      onChange={e => updateProvider(pi, 'port', e.target.value)}
+                    />
                   </Field>
                   <Field label="SSL/TLS"><Toggle checked={!!prov.ssl} onChange={v => updateProvider(pi, 'ssl', v)} /></Field>
                   <Field label="收件箱文件夹">
@@ -572,13 +1008,22 @@ function TabImap() {
                     <Select value={prov.auth_type || 'password'} onChange={e => updateProvider(pi, 'auth_type', e.target.value)}
                       options={[['password','密码/授权码'],['oauth2','OAuth2 (XOAUTH2)']]} />
                   </Field>
-                  <Field label="别名模式" hint="null=自动 (qq/gmail 自动启用 +alias)">
+                  <Field label="注册邮箱模式">
                     <Select
-                      value={prov.use_alias === null || prov.use_alias === undefined ? 'auto' : prov.use_alias ? 'true' : 'false'}
-                      onChange={e => updateProvider(pi, 'use_alias', e.target.value === 'auto' ? null : e.target.value === 'true')}
-                      options={[['auto','自动 (qq/gmail 启用)'],['true','始终启用'],['false','始终禁用']]}
+                      value={prov.address_mode || 'inbox'}
+                      onChange={e => updateProvider(pi, 'address_mode', e.target.value)}
+                      options={[['inbox','收件箱地址'],['plus_alias','+alias 地址'],['random_local_part','自定义域名随机地址']]}
                     />
                   </Field>
+                  {prov.address_mode === 'random_local_part' && (
+                    <Field label="注册域名" hint="仅允许普通域名，如 example.com">
+                      <Input
+                        value={prov.registration_domain || ''}
+                        onChange={e => updateProvider(pi, 'registration_domain', e.target.value)}
+                        placeholder="example.com"
+                      />
+                    </Field>
+                  )}
                 </div>
 
                 {/* Accounts sub-list */}
@@ -1102,7 +1547,7 @@ function TabTimeouts() {
 function TabAdvanced() {
   const [mouse,  setMouse]  = useState({})
   const [timing, setTiming] = useState({})
-  const [oauth,  setOauth]  = useState({ enabled: true, timeout: 45 })
+  const [oauth,  setOauth]  = useState({ enabled: true, timeout: 90 })
   const [reg,    setReg]    = useState({ prefix: '', domain: '' })
   const [team,   setTeam]   = useState({ url: '', key: '' })
   const [sync,   setSync]   = useState({ url: '', key: '' })
@@ -1177,7 +1622,7 @@ function TabAdvanced() {
           <Toggle checked={!!oauth.enabled} onChange={v => setOauth(d => ({ ...d, enabled: v }))} />
         </Field>
         <Field label="OAuth 超时 (秒)">
-          <Input type="number" min={10} max={300} value={oauth.timeout ?? 45} onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
+          <Input type="number" min={10} max={300} value={oauth.timeout ?? 90} onChange={e => setOauth(d => ({ ...d, timeout: +e.target.value }))} />
         </Field>
       </Section>
       <Section title="注册配置">
@@ -1199,6 +1644,9 @@ function TabAdvanced() {
 const TABS = [
   { key: 'general',   label: '⚙️ 通用配置' },
   { key: 'mail',      label: '📧 邮件服务' },
+  { key: 'cfworker',  label: '☁️ CF Worker' },
+  { key: 'cli_proxy', label: '🔗 CLI Proxy' },
+  { key: 'sub2api_upload', label: '📤 Sub2API' },
   { key: 'imap',      label: '📥 IMAP 账户' },
   { key: 'outlook',   label: '🔵 Outlook' },
   { key: 'timeouts',  label: '⏱ 超时设置' },
@@ -1206,7 +1654,7 @@ const TABS = [
 ]
 
 // Mail tab has per-section save buttons, so no global save button shown
-const TABS_WITH_GLOBAL_SAVE = new Set(['general', 'imap', 'outlook', 'timeouts', 'advanced'])
+const TABS_WITH_GLOBAL_SAVE = new Set(['general', 'cfworker', 'cli_proxy', 'sub2api_upload', 'imap', 'outlook', 'timeouts', 'advanced'])
 
 export function Settings() {
   const [tab, setTab] = useState('general')
@@ -1276,6 +1724,9 @@ export function Settings() {
         <div className="p-6 space-y-5">
           {tab === 'general'  && <TabGeneral />}
           {tab === 'mail'     && <TabMail />}
+          {tab === 'cfworker' && <TabCfworker />}
+          {tab === 'cli_proxy' && <TabCliProxy />}
+          {tab === 'sub2api_upload' && <TabSub2APIUpload />}
           {tab === 'imap'     && <TabImap />}
           {tab === 'outlook'  && <TabOutlook />}
           {tab === 'timeouts' && <TabTimeouts />}

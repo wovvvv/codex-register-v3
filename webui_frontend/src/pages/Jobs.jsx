@@ -4,13 +4,15 @@ import api from '../lib/api.js'
 import { StatusBadge, Spinner } from '../components/Badge.jsx'
 import { buildJobsProviderOptions, DEFAULT_JOBS_PROVIDER_OPTIONS } from '../lib/cfworkerConfig.js'
 import { formatJobElapsed } from '../lib/jobTiming.js'
-import { EMPTY_SUB2API_UPLOAD_CONFIG, normalizeSub2APIUploadConfig, serializeSub2APIUploadConfig } from '../lib/sub2apiUploadConfig.js'
 
 function useProviderOptions() {
   const [opts, setOpts] = useState(DEFAULT_JOBS_PROVIDER_OPTIONS)
   useEffect(() => {
-    api.getSettings().then((settings) => {
-      setOpts(buildJobsProviderOptions(settings))
+    Promise.all([
+      api.getSettings(),
+      api.getOutlookStats().catch(() => null),
+    ]).then(([settings, outlookStats]) => {
+      setOpts(buildJobsProviderOptions(settings, { outlookStats }))
     }).catch(() => {})
   }, [])
   return opts
@@ -52,14 +54,11 @@ export function Jobs() {
     engine: 'camoufox',
     provider: 'imap:0',
     upload_provider: 'none',
-    sub2api_upload: { ...EMPTY_SUB2API_UPLOAD_CONFIG },
   })
   const [starting, setStarting]   = useState(false)
   const [startErr, setStartErr]   = useState('')
   const logRef                    = useRef(null)
   const providerOpts              = useProviderOptions()
-  const [jobGroupIdsText, setJobGroupIdsText] = useState('')
-  const [jobModelWhitelistText, setJobModelWhitelistText] = useState('')
 
   // Bulk selection
   const [sel, setSel]       = useState(new Set())
@@ -76,14 +75,10 @@ export function Jobs() {
 
   useEffect(() => {
     api.getMergedConfig().then((cfg) => {
-      const normalized = normalizeSub2APIUploadConfig(cfg?.sub2api_upload)
       setForm((prev) => ({
         ...prev,
         upload_provider: typeof cfg?.upload_provider === 'string' ? cfg.upload_provider : 'none',
-        sub2api_upload: normalized,
       }))
-      setJobGroupIdsText(normalized.group_ids.join('\n'))
-      setJobModelWhitelistText(normalized.model_whitelist.join('\n'))
     }).catch(() => {})
   }, [])
 
@@ -99,31 +94,15 @@ export function Jobs() {
     setStarting(true); setStartErr('')
     try {
       const payload = {
-        ...form,
-        sub2api_upload: serializeSub2APIUploadConfig(form.sub2api_upload),
+        count: form.count,
+        engine: form.engine,
+        provider: form.provider,
+        upload_provider: form.upload_provider,
       }
       const { job_id } = await api.startJob(payload); setSelected(job_id); api.getJobs().then(setJobs)
     }
     catch (e) { setStartErr(e.message) }
     finally { setStarting(false) }
-  }
-
-  const setUploadField = (key, value) => {
-    setForm((prev) => ({
-      ...prev,
-      sub2api_upload: {
-        ...prev.sub2api_upload,
-        [key]: value,
-      },
-    }))
-  }
-  const handleJobGroupIdsTextChange = (value) => {
-    setJobGroupIdsText(value)
-    setUploadField('group_ids', value.split(/[\n,]/).map(item => item.trim()).filter(Boolean))
-  }
-  const handleJobModelWhitelistTextChange = (value) => {
-    setJobModelWhitelistText(value)
-    setUploadField('model_whitelist', value.split(/[\n,]/).map(item => item.trim()).filter(Boolean))
   }
 
   const cancelJob = async (id, e) => { e.stopPropagation(); await api.cancelJob(id).catch(() => {}); api.getJobs().then(setJobs) }
@@ -212,75 +191,6 @@ export function Jobs() {
                 <option value="sub2api">Sub2API</option>
               </select>
             </label>
-            {form.upload_provider === 'sub2api' && (
-              <div className="space-y-3 rounded-xl border border-gray-100 bg-gray-50/70 p-4">
-                <p className="text-xs font-medium text-gray-600">Sub2API 任务覆盖</p>
-                <label className="block">
-                  <span className="text-xs text-gray-500 font-medium">Group IDs</span>
-                  <textarea
-                    rows={3}
-                    value={jobGroupIdsText}
-                    onChange={e => handleJobGroupIdsTextChange(e.target.value)}
-                    className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
-                    placeholder={"1\n2"}
-                  />
-                </label>
-                <label className="block">
-                  <span className="text-xs text-gray-500 font-medium">Proxy ID</span>
-                  <input type="number" min={1} value={form.sub2api_upload.proxy_id}
-                    onChange={e => setUploadField('proxy_id', e.target.value)}
-                    className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                </label>
-                <label className="block">
-                  <span className="text-xs text-gray-500 font-medium">备注</span>
-                  <input value={form.sub2api_upload.notes}
-                    onChange={e => setUploadField('notes', e.target.value)}
-                    className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                </label>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="block">
-                    <span className="text-xs text-gray-500 font-medium">并发数</span>
-                    <input type="number" min={1} value={form.sub2api_upload.concurrency}
-                      onChange={e => setUploadField('concurrency', e.target.value)}
-                      className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-500 font-medium">负载因子</span>
-                    <input type="number" min={1} value={form.sub2api_upload.load_factor}
-                      onChange={e => setUploadField('load_factor', e.target.value)}
-                      className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-500 font-medium">优先级</span>
-                    <input type="number" min={1} value={form.sub2api_upload.priority}
-                      onChange={e => setUploadField('priority', e.target.value)}
-                      className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                  </label>
-                  <label className="block">
-                    <span className="text-xs text-gray-500 font-medium">账号计费倍率</span>
-                    <input type="number" min={0} step="0.1" value={form.sub2api_upload.rate_multiplier}
-                      onChange={e => setUploadField('rate_multiplier', e.target.value)}
-                      className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" />
-                  </label>
-                </div>
-                <label className="flex items-center gap-2 text-sm text-gray-700">
-                  <input type="checkbox" checked={!!form.sub2api_upload.import_models}
-                    onChange={e => setUploadField('import_models', e.target.checked)}
-                    className="rounded accent-blue-600" />
-                  自动获取可用模型
-                </label>
-                <label className="block">
-                  <span className="text-xs text-gray-500 font-medium">模型白名单</span>
-                  <textarea
-                    rows={4}
-                    value={jobModelWhitelistText}
-                    onChange={e => handleJobModelWhitelistTextChange(e.target.value)}
-                    className="mt-1 block w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
-                    placeholder={"gpt-5.4\ngpt-5.1-codex"}
-                  />
-                </label>
-              </div>
-            )}
             {startErr && <p className="text-xs text-red-500">{startErr}</p>}
             <button onClick={startJob} disabled={starting}
               className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white font-medium py-2.5 rounded-lg text-sm transition-colors">

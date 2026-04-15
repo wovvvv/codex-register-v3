@@ -8,8 +8,11 @@ import { buildDashboardProviderOptions, DEFAULT_DASHBOARD_PROVIDER_OPTIONS } fro
 function useProviderOptions() {
   const [opts, setOpts] = useState(DEFAULT_DASHBOARD_PROVIDER_OPTIONS)
   useEffect(() => {
-    api.getSettings().then((settings) => {
-      setOpts(buildDashboardProviderOptions(settings))
+    Promise.all([
+      api.getSettings(),
+      api.getOutlookStats().catch(() => null),
+    ]).then(([settings, outlookStats]) => {
+      setOpts(buildDashboardProviderOptions(settings, { outlookStats }))
     }).catch(() => {})
   }, [])
   return opts

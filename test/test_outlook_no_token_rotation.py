@@ -1,7 +1,6 @@
-"""Outlook provider split helper tests."""
+"""Outlook no-token 轮换选择测试。"""
 from __future__ import annotations
 
-import asyncio
 import importlib
 import sys
 import types
@@ -167,125 +166,70 @@ def _install_test_stubs() -> None:
 _install_test_stubs()
 
 
-class OutlookProviderSplitTests(unittest.TestCase):
+class OutlookNoTokenRotationTests(unittest.TestCase):
     def _import_server(self):
         return importlib.import_module("src.webui.server")
 
-    def test_select_outlook_accounts_keeps_mixed_rotation_for_plain_outlook(self):
+    def test_build_outlook_rotation_stats_counts_remaining_no_token_accounts(self):
+        web_server = self._import_server()
+        stats = web_server._build_outlook_rotation_stats(
+            [
+                {"email": "done@example.com"},
+                {"email": "todo@example.com"},
+                {"email": "todo2@example.com"},
+                {"email": " "},
+            ],
+            {"done@example.com", "other@example.com"},
+        )
+
+        self.assertEqual(stats["configured"], 3)
+        self.assertEqual(stats["with_token"], 1)
+        self.assertEqual(stats["without_token"], 2)
+
+    def test_select_outlook_accounts_keeps_full_rotation_for_plain_outlook(self):
         web_server = self._import_server()
         configured = [
-            {"email": "imap@example.com", "fetch_method": "imap"},
-            {"email": "graph@example.com", "fetch_method": "graph"},
-            {"email": "default@example.com"},
+            {"email": "done@example.com"},
+            {"email": "todo@example.com"},
         ]
 
-        selected = web_server._select_outlook_accounts("outlook", configured)
+        selected = web_server._select_outlook_accounts(
+            "outlook",
+            configured,
+            {"done@example.com"},
+        )
 
         self.assertEqual(
             [item["email"] for item in selected],
-            ["imap@example.com", "graph@example.com", "default@example.com"],
+            ["done@example.com", "todo@example.com"],
         )
 
-    def test_select_outlook_accounts_filters_to_imap_accounts(self):
+    def test_select_outlook_accounts_filters_existing_token_emails(self):
         web_server = self._import_server()
         configured = [
-            {"email": "imap@example.com", "fetch_method": "imap"},
-            {"email": "graph@example.com", "fetch_method": "graph"},
-            {"email": "default@example.com"},
+            {"email": " Done@Example.com "},
+            {"email": "todo@example.com"},
+            {"email": "  "},
         ]
 
-        selected = web_server._select_outlook_accounts("outlook-imap", configured)
-
-        self.assertEqual([item["email"] for item in selected], ["imap@example.com"])
-
-    def test_select_outlook_accounts_filters_to_graph_accounts(self):
-        web_server = self._import_server()
-        configured = [
-            {"email": "imap@example.com", "fetch_method": "imap"},
-            {"email": "graph@example.com", "fetch_method": "graph"},
-            {"email": "default@example.com"},
-        ]
-
-        selected = web_server._select_outlook_accounts("outlook-graph", configured)
-
-        self.assertEqual(
-            [item["email"] for item in selected],
-            ["graph@example.com", "default@example.com"],
+        selected = web_server._select_outlook_accounts(
+            "outlook:no-token",
+            configured,
+            {"done@example.com"},
         )
 
-    def test_parse_outlook_provider_selector_extracts_filtered_index(self):
+        self.assertEqual([item["email"] for item in selected], ["todo@example.com"])
+
+    def test_job_records_finished_timestamp_when_marked_done(self):
         web_server = self._import_server()
+        with patch("src.webui.server.time.time", side_effect=[100.0, 160.0]):
+            job = web_server._Job("job-1", 1, "outlook:no-token", "camoufox", "none")
+            job.set_status("done")
+            payload = job.to_dict()
 
-        family, fixed_index = web_server._parse_outlook_provider_selector("outlook-imap:1")
-
-        self.assertEqual(family, "outlook-imap")
-        self.assertEqual(fixed_index, 1)
-
-    def test_parse_outlook_provider_selector_rejects_malformed_split_suffix(self):
-        web_server = self._import_server()
-
-        with self.assertRaisesRegex(ValueError, "Outlook provider selector 无效"):
-            web_server._parse_outlook_provider_selector("outlook-imap:bad")
-
-    def test_run_job_applies_filtered_index_for_outlook_graph_selector(self):
-        web_server = self._import_server()
-        job = web_server._Job("job-graph-index", 1, "outlook-graph:1", "playwright", "none")
-        captured_mail_clients = []
-
-        async def _fake_register_one(*_args, **kwargs):
-            captured_mail_clients.append(kwargs.get("mail_client"))
-            return {"email": "ok@example.com", "status": "注册完成"}
-
-        async def _fake_build_config():
-            return {
-                "proxy_strategy": "none",
-                "max_concurrent": 1,
-                "mail": {
-                    "imap": [],
-                    "outlook": [
-                        {"email": "imap-a@example.com", "fetch_method": "imap"},
-                        {"email": "graph-a@example.com", "fetch_method": "graph"},
-                        {"email": "imap-b@example.com", "fetch_method": "imap"},
-                        {"email": "graph-b@example.com", "fetch_method": "graph"},
-                    ],
-                },
-            }
-
-        with patch("src.webui.server.settings_db.build_config", new=AsyncMock(side_effect=_fake_build_config)), \
-             patch("src.webui.server.register_one", new=AsyncMock(side_effect=_fake_register_one)), \
-             patch("src.webui.server.persist_account_and_maybe_upload", new=AsyncMock(side_effect=lambda result, *_args, **_kwargs: result)), \
-             patch("src.webui.server.OutlookMailClient", side_effect=lambda **kwargs: kwargs):
-            asyncio.run(web_server._run_job(job))
-
-        self.assertEqual(job.status, "done")
-        self.assertEqual(len(captured_mail_clients), 1)
-        self.assertEqual(captured_mail_clients[0]["email"], "graph-b@example.com")
-        self.assertEqual(captured_mail_clients[0]["fetch_method"], "graph")
-
-    def test_run_job_reports_empty_filtered_outlook_imap_pool(self):
-        web_server = self._import_server()
-        job = web_server._Job("job-imap-empty", 1, "outlook-imap", "playwright", "none")
-
-        async def _fake_build_config():
-            return {
-                "proxy_strategy": "none",
-                "max_concurrent": 1,
-                "mail": {
-                    "imap": [],
-                    "outlook": [
-                        {"email": "graph-a@example.com", "fetch_method": "graph"},
-                    ],
-                },
-            }
-
-        with patch("src.webui.server.settings_db.build_config", new=AsyncMock(side_effect=_fake_build_config)):
-            asyncio.run(web_server._run_job(job))
-
-        self.assertEqual(job.status, "done")
-        self.assertTrue(
-            any("没有配置 fetch_method=imap 的 Outlook 账户" in line for line in job.logs),
-            msg=f"logs did not include expected empty filtered-pool error: {job.logs}",
-        )
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(payload["started"], 100.0)
+        self.assertEqual(payload["finished"], 160.0)
 
 
 if __name__ == "__main__":

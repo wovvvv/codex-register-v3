@@ -51,11 +51,6 @@ function normalizeDomain(value) {
   return normalizeString(value).toLowerCase()
 }
 
-function normalizeOutlookFetchMethod(value) {
-  const source = value === undefined ? 'graph' : value
-  return String(source).trim().toLowerCase()
-}
-
 export function normalizeDomainList(value) {
   const list = Array.isArray(value)
     ? value
@@ -105,21 +100,14 @@ export function serializeCfworkerConfig(raw) {
   }
 }
 
-function isOutlookImapAccount(account) {
-  return normalizeOutlookFetchMethod(account?.fetch_method) === 'imap'
+function buildOutlookNoTokenLabel(outlookStats) {
+  const remaining = Number(outlookStats?.without_token)
+  return Number.isFinite(remaining) && remaining >= 0
+    ? `Outlook（仅未获取 Access Token 账户轮换，剩余 ${remaining} 个）`
+    : 'Outlook（仅未获取 Access Token 账户轮换）'
 }
 
-function isOutlookGraphAccount(account) {
-  return normalizeOutlookFetchMethod(account?.fetch_method) === 'graph'
-}
-
-function buildOutlookAccountLabel(account, index) {
-  const methodLabel = isOutlookImapAccount(account) ? 'IMAP' : 'Graph'
-  const email = account?.email ? account.email : `Outlook 账户 ${index + 1}`
-  return `└ ${methodLabel}: ${email}`
-}
-
-function buildProviderOptions(settings = {}, mode = 'settings') {
+function buildProviderOptions(settings = {}, mode = 'settings', meta = {}) {
   const items = []
   const imapProviders = Array.isArray(settings['mail.imap']) ? settings['mail.imap'] : []
   const isProviderShape = imapProviders.length > 0 && imapProviders[0] && typeof imapProviders[0] === 'object' && 'accounts' in imapProviders[0]
@@ -151,33 +139,22 @@ function buildProviderOptions(settings = {}, mode = 'settings') {
   }
 
   const outlookAccounts = Array.isArray(settings['mail.outlook']) ? settings['mail.outlook'] : []
+  const outlookNoTokenLabel = buildOutlookNoTokenLabel(meta.outlookStats)
   if (outlookAccounts.length > 0) {
-    const outlookImapAccounts = outlookAccounts.filter((acc) => isOutlookImapAccount(acc))
-    const outlookGraphAccounts = outlookAccounts.filter((acc) => isOutlookGraphAccount(acc))
-
-    items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
-
-    if (mode !== 'settings') {
-      if (outlookImapAccounts.length > 0) {
-        items.push(['outlook-imap', `Outlook IMAP（${outlookImapAccounts.length} 账户轮换）`])
+    if (mode === 'dashboard') {
+      items.push(['outlook', `Outlook (${outlookAccounts.length} 账户)`])
+      items.push(['outlook:no-token', outlookNoTokenLabel])
+    } else {
+      items.push(['outlook', `Outlook（全部 ${outlookAccounts.length} 账户轮换）`])
+      if (mode !== 'settings') {
+        items.push(['outlook:no-token', outlookNoTokenLabel])
       }
-      if (outlookGraphAccounts.length > 0) {
-        items.push(['outlook-graph', `Outlook Graph（${outlookGraphAccounts.length} 账户轮换）`])
+      if (mode !== 'dashboard') {
+        outlookAccounts.forEach((acc, i) => {
+          const label = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
+          items.push([`outlook:${i}`, `└ ${label}`])
+        })
       }
-    }
-
-    if (mode === 'jobs') {
-      outlookAccounts.forEach((acc, i) => {
-        items.push([`outlook:${i}`, buildOutlookAccountLabel(acc, i)])
-      })
-      outlookImapAccounts.forEach((acc, i) => {
-        const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
-        items.push([`outlook-imap:${i}`, `└ IMAP: ${email}`])
-      })
-      outlookGraphAccounts.forEach((acc, i) => {
-        const email = acc?.email ? acc.email : `Outlook 账户 ${i + 1}`
-        items.push([`outlook-graph:${i}`, `└ Graph: ${email}`])
-      })
     }
   }
 
@@ -195,9 +172,9 @@ export function buildSettingsProviderOptions(settings) {
 }
 
 export function buildDashboardProviderOptions(settings, meta) {
-  return buildProviderOptions(settings, 'dashboard')
+  return buildProviderOptions(settings, 'dashboard', meta)
 }
 
 export function buildJobsProviderOptions(settings, meta) {
-  return buildProviderOptions(settings, 'jobs')
+  return buildProviderOptions(settings, 'jobs', meta)
 }

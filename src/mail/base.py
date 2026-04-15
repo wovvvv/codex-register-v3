@@ -27,3 +27,9 @@ class MailClient(ABC):
         """
         ...
 
+    def supports_fresh_message_tracking(self) -> bool:
+        """
+        Return True when ``poll_code()`` already deduplicates by message identity
+        (UID / message id) rather than by code string alone.
+        """
+        return False

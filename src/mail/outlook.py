@@ -29,6 +29,8 @@ import email as email_lib
 import re
 import time
 from email.header import decode_header, make_header
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -49,6 +51,7 @@ _IMAP_FOLDERS       = ["INBOX", "Junk"]    # also check Junk — OTP often lands
 
 _SCOPE_GRAPH = "https://graph.microsoft.com/Mail.Read offline_access"
 _SCOPE_IMAP  = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+_SESSION_GRACE_SECONDS = 5.0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -66,6 +69,34 @@ def _decode_str(raw) -> str:
         return str(make_header(decode_header(raw or "")))
     except Exception:
         return str(raw or "")
+
+
+def _parse_received_timestamp(raw: Optional[str]) -> Optional[float]:
+    if not raw:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        try:
+            dt = parsedate_to_datetime(str(raw))
+        except Exception:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _is_message_recent_enough(
+    received_at: Optional[float],
+    session_started_at: float,
+    *,
+    grace_seconds: float = _SESSION_GRACE_SECONDS,
+) -> bool:
+    if not session_started_at or received_at is None:
+        return True
+    return received_at >= session_started_at - grace_seconds
 
 
 def _extract_text(msg: email_lib.message.Message) -> str:
@@ -132,6 +163,7 @@ class OutlookMailClient(MailClient):
         self._fetch_method  = fetch_method
         self._proxy         = proxy        # forwarded to every httpx client
         self._token_expiry  = 0.0   # Unix timestamp; 0 = always refresh
+        self._mailbox_session_started_at = 0.0
         # Instance-level UID/ID tracking — persists across poll_code() calls so
         # the registration OTP mail is not re-returned during the subsequent
         # OAuth login OTP poll.
@@ -171,6 +203,7 @@ class OutlookMailClient(MailClient):
         we retry once through the configured proxy.
         """
         import json as _json
+        import urllib.error as _urlerr
         import ssl as _ssl
         import urllib.parse as _urlparse
         import urllib.request as _urlreq
@@ -194,8 +227,14 @@ class OutlookMailClient(MailClient):
         )
 
         def _fetch(opener) -> dict:
-            with opener.open(req, timeout=25) as resp:
-                data = _json.loads(resp.read())
+            try:
+                with opener.open(req, timeout=25) as resp:
+                    data = _json.loads(resp.read())
+            except _urlerr.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Token endpoint HTTP {exc.code}: {body}"
+                ) from exc
             if "access_token" not in data:
                 raise RuntimeError(
                     f"Token endpoint returned no access_token: {data}"
@@ -207,13 +246,15 @@ class OutlookMailClient(MailClient):
         # ProxyHandler({}) explicitly disables system proxy so urllib doesn't
         # pick up the Windows registry proxy (e.g. Clash's auto-set system proxy)
         # which would break TLS for port 443.
+        direct_exc: Exception | None = None
         try:
             no_proxy_opener = _urlreq.build_opener(_urlreq.ProxyHandler({}))
             return _fetch(no_proxy_opener)
-        except Exception as direct_exc:
+        except Exception as exc:
+            direct_exc = exc
             logger.debug(
-                f"[Outlook] Direct token fetch failed ({type(direct_exc).__name__}: "
-                f"{direct_exc!r}), retrying via proxy…"
+                f"[Outlook] Direct token fetch failed ({type(exc).__name__}: "
+                f"{exc!r}), retrying via proxy…"
             )
 
         # ── Fallback: try via proxy ───────────────────────────────────────
@@ -225,9 +266,10 @@ class OutlookMailClient(MailClient):
             )
             return _fetch(opener)
 
+        detail = repr(direct_exc) if direct_exc is not None else "unavailable"
         raise RuntimeError(
             f"[Outlook] Token refresh failed for {self._email} "
-            f"(direct error: {direct_exc!r}; no proxy configured)"
+            f"(direct error: {detail}; no proxy configured)"
         )
 
     async def _get_token(self) -> str:
@@ -259,8 +301,14 @@ class OutlookMailClient(MailClient):
         domain: Optional[str] = None,
     ) -> str:
         """Return the Outlook address directly (no alias support needed)."""
+        self._mailbox_session_started_at = time.time()
+        self._seen_imap_uids.clear()
+        self._seen_graph_ids.clear()
         logger.info(f"[Outlook] Using account: {self._email}")
         return self._email
+
+    def supports_fresh_message_tracking(self) -> bool:
+        return True
 
     # ── poll ─────────────────────────────────────────────────────────────
 
@@ -325,6 +373,16 @@ class OutlookMailClient(MailClient):
                     if mid in seen_ids:
                         continue
                     seen_ids.add(mid)
+                    received_at = _parse_received_timestamp(msg.get("receivedDateTime"))
+                    if not _is_message_recent_enough(
+                        received_at,
+                        self._mailbox_session_started_at,
+                    ):
+                        logger.debug(
+                            f"[Outlook/Graph] Skip pre-session mail for {self._email} "
+                            f"(received={msg.get('receivedDateTime')!r})"
+                        )
+                        continue
                     subject = msg.get("subject", "")
                     body    = (msg.get("body") or {}).get("content", "")
                     code    = _extract_code(f"{subject} {body}")
@@ -491,6 +549,16 @@ class OutlookMailClient(MailClient):
                                 continue
 
                             msg     = email_lib.message_from_bytes(raw_bytes)
+                            received_at = _parse_received_timestamp(msg.get("Date"))
+                            if not _is_message_recent_enough(
+                                received_at,
+                                self._mailbox_session_started_at,
+                            ):
+                                logger.debug(
+                                    f"[Outlook/IMAP-proxy] Skip pre-session mail for {self._email} "
+                                    f"(folder={folder_name}, date={msg.get('Date', '')!r})"
+                                )
+                                continue
                             subject = _decode_str(msg.get("Subject", ""))
                             body    = _extract_text(msg)
                             code    = _extract_code(f"{subject} {body}")
@@ -606,6 +674,16 @@ class OutlookMailClient(MailClient):
                                 continue
 
                             msg     = email_lib.message_from_bytes(raw_bytes)
+                            received_at = _parse_received_timestamp(msg.get("Date"))
+                            if not _is_message_recent_enough(
+                                received_at,
+                                self._mailbox_session_started_at,
+                            ):
+                                logger.debug(
+                                    f"[Outlook/IMAP] Skip pre-session mail for {self._email} "
+                                    f"(folder={folder_name}, date={msg.get('Date', '')!r})"
+                                )
+                                continue
                             subject = _decode_str(msg.get("Subject", ""))
                             body    = _extract_text(msg)
                             code    = _extract_code(f"{subject} {body}")
@@ -690,3 +768,5 @@ class MultiOutlookMailClient(MailClient):
             client = self._clients[0]
         return await client.poll_code(email, timeout)
 
+    def supports_fresh_message_tracking(self) -> bool:
+        return True

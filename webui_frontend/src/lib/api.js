@@ -51,6 +51,7 @@ const api = {
   saveImapAccounts:     (accounts) => req('POST', '/mail/import/imap/save',     { accounts }),
   parseOutlookAccounts: (text)     => req('POST', '/mail/import/outlook',       { text }),
   saveOutlookAccounts:  (accounts) => req('POST', '/mail/import/outlook/save',  { accounts }),
+  getOutlookStats:      ()         => req('GET',  '/mail/outlook/stats'),
 
   // ── Accounts ─────────────────────────────────────────────────────────
   getAccounts:        (params = {}) => req('GET',    '/accounts?' + new URLSearchParams(params)),

@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  app:
+    # 单容器部署即可满足当前 SQLite + 进程内任务状态模型。
+    container_name: codex-register-v3
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${APP_PORT:-7860}:7860"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "7860"
+      # 默认预取 Camoufox 运行资源；entrypoint 内有哨兵文件，重复启动不会重复下载。
+      FETCH_CAMOUFOX: "${FETCH_CAMOUFOX:-1}"
+    volumes:
+      - ./data:/data
+    # Chromium 在共享内存过小时容易异常退出，这里直接给足。
+    shm_size: "1gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -41,6 +41,7 @@ import re
 import string
 import time
 from email.header import decode_header, make_header
+from email.utils import getaddresses
 from typing import Optional
 
 import aioimaplib
@@ -51,6 +52,7 @@ from src.mail.base import MailClient
 # ── Constants ─────────────────────────────────────────────────────────────
 
 _ALIAS_DOMAINS: frozenset[str] = frozenset({"qq.com", "gmail.com"})
+_ADDRESS_MODES: frozenset[str] = frozenset({"inbox", "plus_alias", "random_local_part"})
 
 # Well-known IMAP hosts auto-detected from email domain.
 _AUTO_HOSTS: dict[str, str] = {
@@ -119,10 +121,53 @@ def _random_alias(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
+def _sanitize_local_part(value: str) -> str:
+    """保留邮箱 local-part 常见安全字符，其余字符移除。"""
+    return re.sub(r"[^A-Za-z0-9._-]+", "", value or "")
+
+
+def _validate_registration_domain(domain: str) -> str:
+    """校验注册域名是否为普通 DNS hostname，返回小写规范值。"""
+    d = (domain or "").strip().lower()
+    if not d:
+        raise ValueError("registration_domain is required")
+    if "*" in d:
+        raise ValueError("registration_domain must not contain wildcard")
+    if "." not in d:
+        raise ValueError("registration_domain must contain at least one dot")
+    if not re.fullmatch(
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+        d,
+    ):
+        raise ValueError("registration_domain must be a plain DNS hostname")
+    return d
+
+
 def _make_xoauth2_token(email: str, access_token: str) -> str:
     """Build the base64-encoded XOAUTH2 SASL token for IMAP authentication."""
     raw = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
     return base64.b64encode(raw.encode()).decode()
+
+
+def is_provider_based_imap_config(imap_raw: object) -> bool:
+    """判断 IMAP 配置是否为 provider-based 结构。"""
+    if isinstance(imap_raw, dict):
+        return "accounts" in imap_raw
+    if isinstance(imap_raw, list) and imap_raw and isinstance(imap_raw[0], dict):
+        return "accounts" in imap_raw[0]
+    return False
+
+
+def parse_imap_selector(provider: str) -> tuple[Optional[int], Optional[int]]:
+    """解析 selector: imap / imap:N / imap:N:M。"""
+    parts = provider.split(":")
+    provider_idx: Optional[int] = None
+    account_idx: Optional[int] = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        provider_idx = int(parts[1])
+    if len(parts) >= 3 and parts[2].isdigit():
+        account_idx = int(parts[2])
+    return provider_idx, account_idx
 
 
 # ── Single-account IMAP client ────────────────────────────────────────────
@@ -153,6 +198,9 @@ class IMAPMailClient(MailClient):
         ssl: bool = True,
         folder: str = "INBOX",
         use_alias: Optional[bool] = None,
+        address_mode: Optional[str] = None,
+        registration_domain: str = "",
+        provider_name: str = "",
         auth_type: str = "password",
         access_token: str = "",
     ) -> None:
@@ -164,11 +212,55 @@ class IMAPMailClient(MailClient):
         self._folder       = folder
         self._auth_type    = auth_type
         self._access_token = access_token
+        self._provider_name = provider_name or "imap"
 
-        if use_alias is None:
-            domain    = email.split("@")[-1].lower() if "@" in email else ""
-            use_alias = domain in _ALIAS_DOMAINS
-        self._use_alias: bool = use_alias
+        # 兼容旧配置：未传 address_mode 时继续沿用 use_alias / 域名自动 alias 逻辑。
+        if address_mode:
+            mode_normalized = address_mode.strip().lower()
+            if mode_normalized not in _ADDRESS_MODES:
+                raise ValueError(
+                    f"Unknown address_mode: {address_mode!r}, "
+                    f"expected one of {sorted(_ADDRESS_MODES)}"
+                )
+            self._address_mode = mode_normalized
+        else:
+            if use_alias is None:
+                domain = email.split("@")[-1].lower() if "@" in email else ""
+                use_alias = domain in _ALIAS_DOMAINS
+            self._address_mode = "plus_alias" if use_alias else "inbox"
+        self._use_alias = self._address_mode == "plus_alias"
+
+        self._registration_domain = (
+            _validate_registration_domain(registration_domain)
+            if registration_domain
+            else ""
+        )
+
+    def _message_matches_filter(
+        self,
+        msg: email_lib.message.Message,
+        filter_to: Optional[str],
+    ) -> bool:
+        """检查邮件是否匹配 To/Delivered-To 过滤条件。"""
+        if not filter_to:
+            return True
+        needle = filter_to.lower()
+        to_values = msg.get_all("To", [])
+        delivered_values = msg.get_all("Delivered-To", [])
+        parsed_addresses = [
+            addr.lower()
+            for _, addr in getaddresses([*to_values, *delivered_values])
+            if addr
+        ]
+        matched = needle in parsed_addresses
+        if not matched:
+            logger.debug(
+                f"[IMAP] provider={self._provider_name} skip=filter_mismatch "
+                f"inbox={self._email} filter_to={needle!r} "
+                f"to={str(to_values)[:120]!r} delivered_to={str(delivered_values)[:120]!r} "
+                f"parsed={parsed_addresses[:6]!r}"
+            )
+        return matched
 
     # ── generate ─────────────────────────────────────────────────────────
 
@@ -183,17 +275,37 @@ class IMAPMailClient(MailClient):
         * **Alias mode** (qq.com / gmail.com or ``use_alias: true``):
           Returns ``local+{random8}@domain``.  The inbox still receives all
           messages sent to any ``+alias`` variant.
+        * **random_local_part mode**:
+          Returns ``{safe_prefix_or_random}@registration_domain`` while still
+          logging into the real IMAP inbox for polling.
         * **Standard mode**: Returns the configured address as-is.
         """
-        if self._use_alias:
+        if self._address_mode == "plus_alias":
             local, _, dom = self._email.partition("@")
             # Strip any pre-existing alias suffix before adding a new one.
             local = local.split("+")[0]
             alias_email = f"{local}+{_random_alias()}@{dom}"
-            logger.info(f"[IMAP] Alias mode — using {alias_email} (inbox: {self._email})")
+            logger.info(
+                f"[IMAP] provider={self._provider_name} mode=plus_alias "
+                f"inbox={self._email} registration={alias_email}"
+            )
             return alias_email
 
-        logger.info(f"[IMAP] Using fixed mailbox: {self._email}")
+        if self._address_mode == "random_local_part":
+            if not self._registration_domain:
+                raise ValueError("registration_domain is required for random_local_part mode")
+            local_part = _sanitize_local_part((prefix or "").strip()) or _random_alias()
+            registration_email = f"{local_part}@{self._registration_domain}"
+            logger.info(
+                f"[IMAP] provider={self._provider_name} mode=random_local_part "
+                f"inbox={self._email} registration={registration_email}"
+            )
+            return registration_email
+
+        logger.info(
+            f"[IMAP] provider={self._provider_name} mode=inbox "
+            f"inbox={self._email} registration={self._email}"
+        )
         return self._email
 
     # ── poll ─────────────────────────────────────────────────────────────
@@ -212,16 +324,15 @@ class IMAPMailClient(MailClient):
         seen_uids: set[str] = set()
         poll_interval = 4   # seconds between IMAP searches
 
-        # If an alias was used, filter incoming messages by To: header.
-        filter_to: Optional[str] = (
-            email.lower()
-            if email.lower() != self._email.lower()
-            else None
-        )
+        # 统一按完整注册邮箱过滤 To/Delivered-To，避免误命中。
+        filter_to: Optional[str] = None
+        if email.lower() != self._email.lower():
+            filter_to = email.lower()
 
         logger.info(
-            f"[IMAP] Polling {self._folder} on {self._host}:{self._port} "
-            f"for {email} (timeout={timeout}s, alias_filter={filter_to is not None})"
+            f"[IMAP] provider={self._provider_name} poll_start "
+            f"inbox={self._email} registration={email} filter_to={filter_to!r} "
+            f"folder={self._folder} host={self._host}:{self._port} timeout={timeout}s"
         )
 
         while time.monotonic() < deadline:
@@ -246,7 +357,7 @@ class IMAPMailClient(MailClient):
                 else:
                     ok, _ = await imap.login(self._email, self._password)
                 if ok != "OK":
-                    logger.warning(f"[IMAP] Login failed: {ok}")
+                    logger.warning(f"[IMAP] provider={self._provider_name} login_failed={ok}")
                     await asyncio.sleep(poll_interval)
                     continue
 
@@ -290,25 +401,21 @@ class IMAPMailClient(MailClient):
 
                     msg = email_lib.message_from_bytes(raw_bytes)
 
-                    # ── Alias filtering: check To: / Delivered-To: headers ─
-                    if filter_to is not None:
-                        to_hdr          = _decode_str(msg.get("To", "")).lower()
-                        delivered_to_hdr = _decode_str(msg.get("Delivered-To", "")).lower()
-                        if filter_to not in to_hdr and filter_to not in delivered_to_hdr:
-                            logger.debug(
-                                f"[IMAP] uid={uid} skipped — "
-                                f"To: {to_hdr[:60]!r} doesn't match {filter_to!r}"
-                            )
-                            continue
+                    if not self._message_matches_filter(msg, filter_to):
+                        continue
 
                     subject  = _decode_str(msg.get("Subject", ""))
                     body     = _extract_text(msg)
                     combined = f"{subject} {body}"
 
-                    logger.debug(f"[IMAP] uid={uid} subject={subject[:60]!r}")
+                    logger.debug(
+                        f"[IMAP] provider={self._provider_name} uid={uid} subject={subject[:60]!r}"
+                    )
                     code = _extract_code(combined)
                     if code:
-                        logger.info(f"[IMAP] Code {code} found in uid={uid}")
+                        logger.info(
+                            f"[IMAP] provider={self._provider_name} uid={uid} code_found={code}"
+                        )
                         await imap.logout()
                         return code
 
@@ -330,7 +437,10 @@ class IMAPMailClient(MailClient):
                 break
             await asyncio.sleep(min(poll_interval, remaining))
 
-        logger.warning(f"[IMAP] Timed out waiting for code ({email})")
+        logger.warning(
+            f"[IMAP] provider={self._provider_name} poll_timeout "
+            f"inbox={self._email} registration={email} filter_to={filter_to!r}"
+        )
         return None
 
 
@@ -376,6 +486,30 @@ class MultiIMAPMailClient(MailClient):
         return await client.poll_code(email, timeout)
 
 
+def build_imap_client_from_provider(
+    prov: dict,
+    acc: dict,
+    provider_idx: int,
+) -> IMAPMailClient:
+    """按 provider 配置 + account 配置构造单个 IMAPMailClient。"""
+    auth_type = prov.get("auth_type", "password")
+    cred = acc.get("credential", "")
+    return IMAPMailClient(
+        email=acc.get("email", ""),
+        password=cred if auth_type == "password" else "",
+        host=prov.get("host", ""),
+        port=int(prov.get("port", 993)),
+        ssl=bool(prov.get("ssl", True)),
+        folder=prov.get("folder", "INBOX"),
+        use_alias=prov.get("use_alias"),
+        address_mode=prov.get("address_mode"),
+        registration_domain=prov.get("registration_domain", ""),
+        provider_name=prov.get("name", f"imap:{provider_idx}"),
+        auth_type=auth_type,
+        access_token=cred if auth_type == "oauth2" else "",
+    )
+
+
 # ── CLI smoke-test ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -419,4 +553,3 @@ if __name__ == "__main__":
         print(f"Code: {code or '(none received)'}")
 
     asyncio.run(_main())
-

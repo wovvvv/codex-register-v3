@@ -14,7 +14,7 @@ import src.settings_db as settings_db
 
 _GENERAL_KEYS = {
     "engine", "headless", "slow_mo", "mobile",
-    "max_concurrent", "mail_provider", "proxy_strategy", "proxy_static",
+    "max_concurrent", "mail_provider", "proxy_strategy", "proxy_static", "upload_provider",
 }
 
 _SECTION_PREFIXES = [
@@ -27,6 +27,8 @@ _SECTION_PREFIXES = [
     "team",
     "sync",
     "oauth",
+    "cli_proxy",
+    "sub2api_upload",
     "mouse",
     "timeouts",
     "timing",

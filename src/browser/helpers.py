@@ -189,10 +189,10 @@ async def find_button_by_texts(page: Page, texts: list[str]) -> Optional[Locator
     """
     Find the first visible button/link whose text matches one of *texts*
     (case-insensitive, partial match).
-    Searches button, a, [role='button'], div, span — mirroring JS querySelectorAll.
+    Searches only interactive elements to avoid matching headings / wrappers.
     """
     for text in texts:
-        for tag in ("button", "a", "[role='button']", "div", "span"):
+        for tag in ("button", "a", "[role='button']"):
             try:
                 loc = page.locator(f"{tag}:has-text('{text}')").first
                 if await loc.is_visible():
@@ -200,6 +200,33 @@ async def find_button_by_texts(page: Page, texts: list[str]) -> Optional[Locator
             except Exception:
                 pass
     return None
+
+
+async def dismiss_google_one_tap(page: Page) -> None:
+    """
+    Hide Google One Tap overlays that can intercept pointer events over auth CTAs.
+    Best-effort only.
+    """
+    try:
+        await page.evaluate("""
+            () => {
+                const selectors = [
+                    '#google-one-tap-anchor',
+                    'iframe[title*="Google"]',
+                    'iframe[src*="accounts.google.com/gsi/iframe"]',
+                ];
+                for (const sel of selectors) {
+                    for (const el of document.querySelectorAll(sel)) {
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('visibility', 'hidden', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                        el.setAttribute('aria-hidden', 'true');
+                    }
+                }
+            }
+        """)
+    except Exception:
+        pass
 
 
 async def click_button_by_texts(page: Page, texts: list[str]) -> bool:
@@ -260,13 +287,14 @@ async def find_signup_button(task_id: str, page: Page) -> Optional[Locator]:
 
     # Strategy 3: exact text match across ALL element types (mirrors JS regex)
     exact_texts = [
+        "More options",
         "Sign up", "Sign Up", "Sign up for free",
         "Create account", "Create Account",
         "Get started", "Register",
         "注册", "免费注册",
     ]
     for text in exact_texts:
-        for tag in ("button", "a", "[role='button']", "div", "span", "p"):
+        for tag in ("button", "a", "[role='button']"):
             try:
                 loc = page.locator(tag).get_by_text(text, exact=True).first
                 if await loc.is_visible():
@@ -277,7 +305,7 @@ async def find_signup_button(task_id: str, page: Page) -> Optional[Locator]:
 
     # Strategy 4: partial text fallback
     logger.debug(f"[{task_id}] signup falling back to partial text search")
-    return await find_button_by_texts(page, ["Sign up", "Create account", "注册"])
+    return await find_button_by_texts(page, ["More options", "Sign up", "Sign up for free", "Create account", "注册"])
 
 
 # ── Spinbutton (year / month / day) ──────────────────────────────────────
@@ -437,5 +465,4 @@ async def human_move_and_click(page: Page, locator: Locator) -> None:
     except Exception as exc:
         logger.debug(f"[helpers] human_move_and_click fallback: {exc}")
         await locator.click()
-
 

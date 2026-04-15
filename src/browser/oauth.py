@@ -140,6 +140,55 @@ def _decode_jwt(token: str) -> dict:
         return {}
 
 
+async def _submit_password_and_advance(page: Page) -> None:
+    """
+    提交 OAuth 登录页密码，并在仍停留在 password 页时回退到 DOM click。
+
+    现网 `auth.openai.com/log-in/password` 在某些浏览器指纹下，
+    文本按钮点击后页面不会继续推进，但原生 DOM click 可以触发内部路由。
+    此处先走现有文本点击，再根据 URL 是否仍停留在 password 页决定是否回退。
+    """
+    before_url = page.url
+    await click_submit_or_text(page, ["Continue", "Login", "Sign in", "Submit", "继续"])
+    await asyncio.sleep(3.0)
+
+    still_on_password = (
+        page.url == before_url
+        or "log-in/password" in page.url
+    )
+    if not still_on_password:
+        return
+
+    logger.warning(
+        f"[oauth] Password submit did not progress — falling back to DOM submit. "
+        f"URL={page.url}"
+    )
+    await page.evaluate(
+        "document.querySelector(\"button[type='submit']\")?.click()"
+    )
+    await asyncio.sleep(3.0)
+
+
+async def _switch_to_passwordless_otp(page: Page) -> bool:
+    """
+    在 Auth0 password 页卡住时，切到“邮箱一次性验证码”登录分支。
+
+    某些账号注册时没有经历密码创建步骤，OAuth 重新登录时虽然会出现
+    `log-in/password`，但真实可行的路径是页面里的
+    `Log in with a one-time code` 按钮。
+    """
+    try:
+        link = page.get_by_text("Log in with a one-time code", exact=True).first
+        if not await link.is_visible():
+            return False
+        logger.info("[oauth] Passwordless OTP option detected — switching login method")
+        await link.click()
+        await asyncio.sleep(2.0)
+        return True
+    except Exception:
+        return False
+
+
 def _extract_code(url: str) -> Optional[str]:
     """Extract the 'code' query parameter from a URL, or None."""
     if not url or "code=" not in url:
@@ -342,10 +391,12 @@ async def acquire_tokens_via_browser(
                         await set_react_input(oauth_page, p_sel, password)
                         logger.debug("[oauth] Filled password on login page")
                         await asyncio.sleep(1.0)
-                        await click_submit_or_text(
-                            oauth_page, ["Continue", "Login", "Sign in", "Submit", "继续"]
-                        )
-                        await asyncio.sleep(3.0)
+                        await _submit_password_and_advance(oauth_page)
+
+                        if "log-in/password" in oauth_page.url and mail_client:
+                            switched = await _switch_to_passwordless_otp(oauth_page)
+                            if switched and log_fn:
+                                log_fn("[OAuth] 检测到一次性验证码登录入口，已切换到邮箱验证码模式…")
 
                         # ── Handle email OTP verification (if Auth0 requires it) ──
                         if mail_client:
@@ -552,16 +603,31 @@ async def _oauth_poll_fresh_code(
     email: str,
     *,
     previous_code: Optional[str],
+    seen_codes: Optional[set[str]] = None,
     timeout: int,
 ) -> Optional[str]:
     """Poll mailbox until a code *different* from previous_code arrives."""
+    seen = set(seen_codes or set())
+    if previous_code:
+        seen.add(previous_code)
+    supports_fresh_tracking = False
+    try:
+        supports_fresh_tracking = bool(mail_client.supports_fresh_message_tracking())
+    except Exception:
+        supports_fresh_tracking = False
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         remaining = max(1, int(deadline - asyncio.get_event_loop().time()))
         fresh = await mail_client.poll_code(email, timeout=min(15, remaining))
-        if fresh and fresh != previous_code:
-            return fresh
-        if fresh == previous_code:
+        if fresh:
+            if fresh not in seen:
+                return fresh
+            if supports_fresh_tracking:
+                logger.debug(
+                    f"[oauth] Same OTP {fresh} came from a fresh message-tracked provider — accepting"
+                )
+                return fresh
+        if fresh in seen:
             logger.debug(f"[oauth] Still seeing old OTP {fresh} — waiting for new one")
         await asyncio.sleep(1.0)
     return None
@@ -628,7 +694,14 @@ async def _handle_oauth_otp(
 
     # ── Poll mailbox ──────────────────────────────────────────────────────────
     otp_timeout = int(timeouts.get("otp_code", 180))
-    code = await mail_client.poll_code(email, timeout=otp_timeout)
+    seen_codes: set[str] = set()
+    code = await _oauth_poll_fresh_code(
+        mail_client,
+        email,
+        previous_code=None,
+        seen_codes=seen_codes,
+        timeout=otp_timeout,
+    )
 
     if not code:
         logger.warning(f"[oauth] OTP code not received within {otp_timeout}s — continuing without fill")
@@ -637,6 +710,7 @@ async def _handle_oauth_otp(
         return
 
     logger.info(f"[oauth] OTP code received — filling: {code}")
+    seen_codes.add(code)
     if log_fn:
         log_fn(f"[OAuth] 验证码已获取，正在填写…")
 
@@ -684,6 +758,7 @@ async def _handle_oauth_otp(
             new_code = await _oauth_poll_fresh_code(
                 mail_client, email,
                 previous_code=code,
+                seen_codes=seen_codes,
                 timeout=otp_timeout,
             )
             if not new_code:
@@ -693,6 +768,7 @@ async def _handle_oauth_otp(
                 break
 
             code = new_code
+            seen_codes.add(code)
             logger.info(f"[oauth] 新验证码 → {code}")
             if log_fn:
                 log_fn(f"[OAuth] 新验证码已获取，正在填写…")
@@ -958,4 +1034,3 @@ async def _exchange_code(
         f"account_id={result.account_id} expires={result.expires_at}"
     )
     return result
-

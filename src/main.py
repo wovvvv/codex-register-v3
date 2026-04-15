@@ -3,7 +3,7 @@ main.py — Typer CLI + asyncio concurrent registration runner.
 
 Commands
 --------
-register   --count N  --engine playwright|camoufox  --provider gptmail|npcmail|yydsmail
+register   --count N  --engine playwright|camoufox  --provider gptmail|npcmail|yydsmail|cfworker
            [--headed]  [--slow-mo N]
 list       [--status filter]
 export     --format json|csv  --output path
@@ -53,6 +53,7 @@ import src.proxy_pool as proxy_pool_mod
 import src.settings_db as settings_db
 from src.mail import get_mail_client
 from src.browser.register import register_one
+from src.post_register import persist_account_and_maybe_upload
 
 app    = typer.Typer(help="ChatGPT headless auto-registration bot", add_completion=False)
 console = Console()
@@ -83,19 +84,22 @@ def _ensure_db() -> None:
 
 _GENERAL_KEYS = {
     "engine", "headless", "slow_mo", "mobile",
-    "max_concurrent", "mail_provider", "proxy_strategy", "proxy_static",
+    "max_concurrent", "mail_provider", "proxy_strategy", "proxy_static", "upload_provider",
 }
 
 _SECTION_PREFIXES = [
     "mail.gptmail",
     "mail.npcmail",
     "mail.yydsmail",
+    "mail.cfworker",
     "mail.imap",
     "mail.outlook",
     "registration",
     "team",
     "sync",
     "oauth",
+    "cli_proxy",
+    "sub2api_upload",
     "mouse",
     "timeouts",
     "timing",
@@ -159,7 +163,7 @@ def _nested_set(data: dict[str, Any], parts: list[str], value: Any) -> dict[str,
 def register(
     count: int = typer.Option(1,  "--count",    "-n", help="Number of accounts to register"),
     engine: str = typer.Option("", "--engine",  "-e", help="Browser engine: playwright | camoufox"),
-    provider: str = typer.Option("", "--provider", "-p", help="Mail provider: gptmail | npcmail | yydsmail | imap"),
+    provider: str = typer.Option("", "--provider", "-p", help="Mail provider: gptmail | npcmail | yydsmail | cfworker | imap"),
     concurrency: int = typer.Option(0, "--concurrency", "-c", help="Max parallel browsers (0 = use config)"),
     proxy: str = typer.Option("", "--proxy", "-x", help="Static proxy URL to use for this run, e.g. http://user:pass@host:port"),
     headed: bool = typer.Option(False, "--headed/--headless", help="Run with a visible browser window (headed mode)"),
@@ -206,7 +210,10 @@ def export(
 ) -> None:
     """Export accounts to JSON or CSV."""
     _ensure_db()
-    out_path = Path(output) if output else Path(f"accounts_export.{fmt}")
+    default_suffix = "zip" if fmt == "json" else fmt
+    out_path = Path(output) if output else Path(f"accounts_export.{default_suffix}")
+    if fmt == "json" and out_path.suffix.lower() == ".json":
+        out_path = out_path.with_suffix(".zip")
     if fmt == "csv":
         n = _run(accounts_mod.export_csv(out_path))
     else:
@@ -398,7 +405,11 @@ async def _register_async(
                 mail_client=mail_client,
                 proxy=proxy,
             )
-            await accounts_mod.upsert(result)
+            result = await persist_account_and_maybe_upload(
+                result,
+                cfg,
+                log_fn=lambda msg: logger.info(f"[task-{task_id}] {msg}"),
+            )
 
             if use_pool and proxy:
                 success = result.get("status") == "注册完成"
@@ -490,5 +501,3 @@ def _run(coro):
 
 if __name__ == "__main__":
     app()
-
-

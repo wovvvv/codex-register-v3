@@ -61,7 +61,6 @@ class _Job:
         engine: str,
         proxy_mode: str,
         upload_provider: str = "",
-        sub2api_upload: Optional[dict[str, Any]] = None,
     ):
         self.id         = job_id
         self.count      = count
@@ -69,7 +68,6 @@ class _Job:
         self.engine     = engine
         self.proxy_mode = proxy_mode
         self.upload_provider = upload_provider
-        self.sub2api_upload = dict(sub2api_upload or {})
         self.status     = "running"
         self.logs: list[str] = []
         self.results: list[dict] = []
@@ -103,7 +101,6 @@ class _Job:
         if full:
             d["logs"]    = self.logs
             d["results"] = self.results
-            d["sub2api_upload"] = self.sub2api_upload
         return d
 
 
@@ -122,18 +119,6 @@ def _select_outlook_accounts(
     provider_lower = str(provider or "").strip().lower()
     accounts = [acc for acc in (configured_accounts or []) if isinstance(acc, dict)]
 
-    if provider_lower == "outlook-imap":
-        return [
-            acc for acc in accounts
-            if str(acc.get("fetch_method", "graph")).strip().lower() == "imap"
-        ]
-
-    if provider_lower == "outlook-graph":
-        return [
-            acc for acc in accounts
-            if str(acc.get("fetch_method", "graph")).strip().lower() == "graph"
-        ]
-
     if provider_lower != "outlook:no-token":
         return accounts
 
@@ -148,21 +133,40 @@ def _select_outlook_accounts(
     ]
 
 
-def _parse_outlook_provider_selector(provider: str) -> tuple[str, Optional[int]]:
+def _build_outlook_rotation_stats(
+    configured_accounts: list[dict],
+    token_emails: Optional[set[str]] = None,
+) -> dict[str, int]:
+    configured = [
+        _normalize_email((acc or {}).get("email"))
+        for acc in (configured_accounts or [])
+        if isinstance(acc, dict)
+    ]
+    configured = [email for email in configured if email]
+    used = {
+        _normalize_email(email)
+        for email in (token_emails or set())
+        if _normalize_email(email)
+    }
+    with_token = sum(1 for email in configured if email in used)
+    return {
+        "configured": len(configured),
+        "with_token": with_token,
+        "without_token": max(0, len(configured) - with_token),
+    }
+
+
+def _resolve_mail_fetch_route(provider: str, mail_client: Any) -> tuple[str, str]:
     provider_lower = str(provider or "").strip().lower()
-    if provider_lower == "outlook:no-token":
-        return provider_lower, None
-
-    if ":" not in provider_lower:
-        return provider_lower, None
-
-    family, suffix = provider_lower.split(":", 1)
-    if family in {"outlook", "outlook-imap", "outlook-graph"}:
-        if suffix.isdigit():
-            return family, int(suffix)
-        raise ValueError(f"Outlook provider selector 无效: {provider}")
-
-    return provider_lower, None
+    email = str(getattr(mail_client, "_email", "") or "").strip()
+    if not email:
+        return "", ""
+    if provider_lower.startswith("outlook"):
+        fetch_method = str(getattr(mail_client, "_fetch_method", "graph") or "graph").strip().lower() or "graph"
+        return email, fetch_method
+    if provider_lower.startswith("imap"):
+        return email, "imap"
+    return "", ""
 
 
 # ── Background runner ─────────────────────────────────────────────────────
@@ -173,9 +177,6 @@ async def _run_job(job: _Job) -> None:
         cfg["engine"] = job.engine
         if job.upload_provider:
             cfg["upload_provider"] = job.upload_provider
-        merged_sub2api_upload = dict(cfg.get("sub2api_upload", {}) if isinstance(cfg.get("sub2api_upload"), dict) else {})
-        merged_sub2api_upload.update(job.sub2api_upload or {})
-        cfg["sub2api_upload"] = merged_sub2api_upload
 
         strategy     = cfg.get("proxy_strategy", "none")
         static_proxy = cfg.get("proxy_static") or None
@@ -191,17 +192,14 @@ async def _run_job(job: _Job) -> None:
         _is_imap_provider = provider_lower.startswith("imap:") and _is_new_imap
         _is_outlook       = provider_lower.startswith("outlook")
         _outlook_accounts: list[dict] = []
-        _outlook_family = "outlook"
-        _outlook_fixed_index: Optional[int] = None
 
         if _is_outlook:
-            _outlook_family, _outlook_fixed_index = _parse_outlook_provider_selector(job.provider)
             token_emails = (
                 await accounts_mod.get_emails_with_access_token()
-                if _outlook_family == "outlook:no-token"
+                if provider_lower == "outlook:no-token"
                 else None
             )
-            _outlook_accounts = _select_outlook_accounts(_outlook_family, out_raw, token_emails)
+            _outlook_accounts = _select_outlook_accounts(job.provider, out_raw, token_emails)
 
         # Build shared client for API providers and old-format IMAP
         _shared_client = None
@@ -238,21 +236,19 @@ async def _run_job(job: _Job) -> None:
                 return build_imap_client_from_provider(prov, acc, provider_idx)
             elif _is_outlook:
                 if not _outlook_accounts:
-                    if _outlook_family == "outlook-imap":
-                        raise ValueError("没有配置 fetch_method=imap 的 Outlook 账户")
-                    if _outlook_family == "outlook-graph":
-                        raise ValueError("没有配置 fetch_method=graph 的 Outlook 账户")
-                    if _outlook_family == "outlook:no-token":
+                    if provider_lower == "outlook:no-token":
                         raise ValueError("没有未获取 Access Token 的 Outlook 账户")
                     raise ValueError("没有配置 Outlook 账户")
 
                 # outlook:N → fixed account N; outlook → rotate through all
-                if _outlook_fixed_index is not None:
-                    if _outlook_fixed_index >= len(_outlook_accounts):
+                _parts = job.provider.lower().split(":")
+                if len(_parts) >= 2 and _parts[1].isdigit():
+                    out_idx = int(_parts[1])
+                    if out_idx >= len(_outlook_accounts):
                         raise ValueError(
-                            f"Outlook 账户索引 {_outlook_fixed_index} 不存在（共 {len(_outlook_accounts)} 个）"
+                            f"Outlook 账户索引 {out_idx} 不存在（共 {len(_outlook_accounts)} 个）"
                         )
-                    acc = _outlook_accounts[_outlook_fixed_index]
+                    acc = _outlook_accounts[out_idx]
                 else:
                     acc = _outlook_accounts[(n - 1) % len(_outlook_accounts)]
 
@@ -289,6 +285,9 @@ async def _run_job(job: _Job) -> None:
                     job.log(f"Task {n}/{job.count} 邮件客户端错误: {exc}")
                     return
 
+                route_email, route_method = _resolve_mail_fetch_route(job.provider, mail_client)
+                if route_email and route_method:
+                    job.log(f"Task {n}/{job.count} 邮箱 {route_email} 使用 {route_method} 获取验证码")
                 job.log(f"Task {n}/{job.count} 启动  proxy={'yes' if proxy else 'none'}")
                 try:
                     result = await register_one(
@@ -561,6 +560,13 @@ async def api_import_outlook_save(request: Request):
     return {"added": len(added), "total": len(existing) + len(added)}
 
 
+@app.get("/api/mail/outlook/stats")
+async def api_outlook_stats():
+    configured = await settings_db.get_section("mail.outlook")
+    token_emails = await accounts_mod.get_emails_with_access_token()
+    return _build_outlook_rotation_stats(configured, token_emails)
+
+
 # ── Accounts API ──────────────────────────────────────────────────────────
 
 @app.get("/api/accounts")
@@ -812,8 +818,6 @@ async def api_start_job(request: Request):
     upload_provider = str(body.get("upload_provider") or cfg.get("upload_provider", "none") or "none").strip().lower()
     if upload_provider not in {"none", "cpa", "sub2api"}:
         upload_provider = "none"
-    raw_sub2api_upload = body.get("sub2api_upload")
-    sub2api_upload = raw_sub2api_upload if isinstance(raw_sub2api_upload, dict) else {}
 
     job_id = str(uuid.uuid4())[:8]
     job = _Job(
@@ -823,7 +827,6 @@ async def api_start_job(request: Request):
         engine,
         cfg.get("proxy_strategy", "none"),
         upload_provider=upload_provider,
-        sub2api_upload=sub2api_upload,
     )
     _jobs[job_id] = job
     job.task = asyncio.create_task(_run_job(job))
