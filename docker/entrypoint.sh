@@ -21,6 +21,11 @@ if [ "${FETCH_CAMOUFOX:-0}" = "1" ] && [ ! -f /data/.camoufox_fetched ]; then
   touch /data/.camoufox_fetched
 fi
 
+# Playwright Chromium 体积较大，放到 /data 持久化缓存，避免每次镜像构建都重新下载。
+if ! compgen -G "/data/.cache/ms-playwright/chromium-*" > /dev/null; then
+  python -m playwright install chromium
+fi
+
 # 容器启动时做幂等数据库初始化，然后直接拉起 WebUI。
 python -m src.main db init
 exec python -m src.main webui --host "${HOST:-0.0.0.0}" --port "${PORT:-7860}"

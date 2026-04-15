@@ -38,8 +38,7 @@ RUN apt-get update \
 
 # 保持运行目录源码完整，直接按当前仓库结构启动模块入口。
 RUN pip install --no-cache-dir . \
-    && chmod +x /entrypoint.sh \
-    && python -m playwright install --with-deps chromium
+    && chmod +x /entrypoint.sh
 
 EXPOSE 7860
 
